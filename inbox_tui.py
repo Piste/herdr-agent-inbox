@@ -184,6 +184,8 @@ def build_tree(rows, history):
     for ws in ws_order:
         ws_emojis = []
         ws_lines = []
+        multi_tab = len(tabs_by_ws[ws]) > 1
+        pane_x = 5 if multi_tab else 3  # dedent when the tab row is hidden
         for tab_id, panes in tabs_by_ws[ws].items():
             tab_emojis = []
             tab_lines = []
@@ -194,14 +196,16 @@ def build_tree(rows, history):
                         closed.append(h)
                 pane_emojis = [chat_emoji(c) for c in chats] + (["⚫"] if closed else [])
                 tab_lines.append(("pane", {"cwd": _short_cwd(chats[0]["cwd"]),
-                                           "flags": _agg(pane_emojis)}))
+                                           "flags": _agg(pane_emojis), "x": pane_x}))
                 for c in chats:
+                    c["_x"] = pane_x + 2
                     tab_lines.append(("row", c))
                 for h in closed:
-                    tab_lines.append(("closed", h))
+                    tab_lines.append(("closed", dict(h, x=pane_x + 2)))
                 tab_emojis.extend(pane_emojis)
-            tab_lines.insert(0, ("tab", {"label": tlabels.get(tab_id, tab_id or "?"),
-                                         "flags": _agg(tab_emojis)}))
+            if multi_tab:  # a single tab adds no information
+                tab_lines.insert(0, ("tab", {"label": tlabels.get(tab_id, tab_id or "?"),
+                                             "flags": _agg(tab_emojis)}))
             ws_lines.extend(tab_lines)
             ws_emojis.extend(tab_emojis)
         lines.append(("ws", {"workspace": rows_ws_label(rows, ws),
@@ -370,13 +374,14 @@ def run(stdscr):
                 seg(yy, x, item["flags"], 0)
                 continue
             if kind == "pane":
-                x = seg(yy, 5, item["cwd"], curses.color_pair(5))
+                x = seg(yy, item.get("x", 5), item["cwd"], curses.color_pair(5))
                 x = seg(yy, x, " — ", curses.A_DIM)
                 seg(yy, x, item["flags"], 0)
                 continue
             if kind == "closed":
-                x = seg(yy, 7, "%s: %s" % (item.get("agent", "?"),
-                                           item.get("title", "")), curses.A_DIM)
+                x = seg(yy, item.get("x", 7), "%s: %s" % (item.get("agent", "?"),
+                                                          item.get("title", "")),
+                        curses.A_DIM)
                 seg(yy, x, " — ⚫", curses.A_DIM)
                 continue
             if kind == "header":
@@ -407,7 +412,7 @@ def run(stdscr):
                 sel_attr = curses.A_REVERSE if selected else 0
                 if selected:
                     stdscr.addnstr(yy, 0, " " * (w - 1), w - 1, sel_attr)
-                x = seg(yy, 7, r["agent"], curses.color_pair(4) | sel_attr)
+                x = seg(yy, r.get("_x", 7), r["agent"], curses.color_pair(4) | sel_attr)
                 x = seg(yy, x, ": ", curses.A_DIM | sel_attr)
                 x = seg(yy, x, r["title"][: max(10, w - x - 8)], attr | sel_attr)
                 x = seg(yy, x, " — ", curses.A_DIM | sel_attr)
