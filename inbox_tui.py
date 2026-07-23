@@ -229,40 +229,51 @@ def do_resume(entry):
     return None
 
 
-# herdr's sidebar renders its selected row with the theme's `surface0`
-# background (see src/app/state.rs + ui/sidebar.rs). Same values here.
-_THEME_SURFACE0 = {
-    "catppuccin": (49, 50, 68), "catppuccin-latte": (204, 208, 218),
-    "tokyo-night": (36, 40, 59), "tokyo-night-day": (196, 200, 218),
-    "dracula": (68, 71, 90), "nord": (59, 66, 82),
-    "gruvbox": (60, 56, 54), "gruvbox-light": (235, 219, 178),
-    "one-dark": (44, 49, 58), "one-light": (240, 240, 241),
-    "solarized": (7, 54, 66), "solarized-light": (238, 232, 213),
-    "kanagawa": (42, 42, 55), "kanagawa-lotus": (220, 213, 172),
-    "rose-pine": (31, 29, 46), "rose-pine-dawn": (242, 233, 225),
-    "vesper": (35, 35, 35),
+# herdr's palettes, extracted from src/app/state.rs. The sidebar signals
+# states with (ui/status.rs): blocked=red, working=yellow, done-unseen=teal,
+# idle/seen=green, unknown=overlay0; selection bg=surface0.
+_THEME_PALETTES = {
+    "catppuccin": {"accent": (137, 180, 250), "red": (243, 139, 168), "yellow": (249, 226, 175), "green": (166, 227, 161), "teal": (148, 226, 213), "blue": (137, 180, 250), "mauve": (203, 166, 247), "overlay0": (108, 112, 134), "surface0": (49, 50, 68)},
+    "catppuccin-latte": {"accent": (30, 102, 245), "red": (210, 15, 57), "yellow": (223, 142, 29), "green": (64, 160, 43), "teal": (23, 146, 153), "blue": (30, 102, 245), "mauve": (136, 57, 239), "overlay0": (156, 160, 176), "surface0": (204, 208, 218)},
+    "tokyo-night": {"accent": (122, 162, 247), "red": (247, 118, 142), "yellow": (224, 175, 104), "green": (158, 206, 106), "teal": (125, 207, 255), "blue": (122, 162, 247), "mauve": (187, 154, 247), "overlay0": (86, 95, 137), "surface0": (36, 40, 59)},
+    "tokyo-night-day": {"accent": (46, 125, 233), "red": (245, 42, 101), "yellow": (140, 108, 62), "green": (88, 117, 57), "teal": (17, 140, 116), "blue": (46, 125, 233), "mauve": (120, 71, 189), "overlay0": (137, 144, 179), "surface0": (196, 200, 218)},
+    "dracula": {"accent": (189, 147, 249), "red": (255, 85, 85), "yellow": (241, 250, 140), "green": (80, 250, 123), "teal": (139, 233, 253), "blue": (139, 233, 253), "mauve": (255, 121, 198), "overlay0": (98, 114, 164), "surface0": (68, 71, 90)},
+    "nord": {"accent": (136, 192, 208), "red": (191, 97, 106), "yellow": (235, 203, 139), "green": (163, 190, 140), "teal": (143, 188, 187), "blue": (129, 161, 193), "mauve": (180, 142, 173), "overlay0": (76, 86, 106), "surface0": (59, 66, 82)},
+    "gruvbox": {"accent": (215, 153, 33), "red": (251, 73, 52), "yellow": (250, 189, 47), "green": (184, 187, 38), "teal": (142, 192, 124), "blue": (131, 165, 152), "mauve": (211, 134, 155), "overlay0": (146, 131, 116), "surface0": (60, 56, 54)},
+    "gruvbox-light": {"accent": (7, 102, 120), "red": (157, 0, 6), "yellow": (181, 118, 20), "green": (121, 116, 14), "teal": (66, 123, 88), "blue": (7, 102, 120), "mauve": (143, 63, 113), "overlay0": (146, 131, 116), "surface0": (235, 219, 178)},
+    "one-dark": {"accent": (97, 175, 239), "red": (224, 108, 117), "yellow": (229, 192, 123), "green": (152, 195, 121), "teal": (86, 182, 194), "blue": (97, 175, 239), "mauve": (198, 120, 221), "overlay0": (92, 99, 112), "surface0": (44, 49, 58)},
+    "one-light": {"accent": (64, 120, 242), "red": (228, 86, 73), "yellow": (193, 132, 1), "green": (80, 161, 79), "teal": (1, 132, 188), "blue": (64, 120, 242), "mauve": (166, 38, 164), "overlay0": (160, 161, 167), "surface0": (240, 240, 241)},
+    "solarized": {"accent": (38, 139, 210), "red": (220, 50, 47), "yellow": (181, 137, 0), "green": (133, 153, 0), "teal": (42, 161, 152), "blue": (38, 139, 210), "mauve": (211, 54, 130), "overlay0": (88, 110, 117), "surface0": (7, 54, 66)},
+    "solarized-light": {"accent": (38, 139, 210), "red": (220, 50, 47), "yellow": (181, 137, 0), "green": (133, 153, 0), "teal": (42, 161, 152), "blue": (38, 139, 210), "mauve": (211, 54, 130), "overlay0": (147, 161, 161), "surface0": (238, 232, 213)},
+    "kanagawa": {"accent": (126, 156, 216), "red": (195, 64, 67), "yellow": (192, 163, 110), "green": (118, 148, 106), "teal": (127, 180, 202), "blue": (126, 156, 216), "mauve": (149, 127, 184), "overlay0": (114, 113, 105), "surface0": (42, 42, 55)},
+    "kanagawa-lotus": {"accent": (77, 105, 155), "red": (200, 64, 83), "yellow": (119, 113, 63), "green": (111, 137, 78), "teal": (78, 140, 162), "blue": (77, 105, 155), "mauve": (98, 76, 131), "overlay0": (160, 156, 172), "surface0": (220, 213, 172)},
+    "rose-pine": {"accent": (196, 167, 231), "red": (235, 111, 146), "yellow": (246, 193, 119), "green": (49, 116, 143), "teal": (156, 207, 216), "blue": (49, 116, 143), "mauve": (196, 167, 231), "overlay0": (110, 106, 134), "surface0": (31, 29, 46)},
+    "rose-pine-dawn": {"accent": (144, 122, 169), "red": (180, 99, 122), "yellow": (234, 157, 52), "green": (40, 105, 131), "teal": (86, 148, 159), "blue": (40, 105, 131), "mauve": (144, 122, 169), "overlay0": (152, 147, 165), "surface0": (242, 233, 225)},
+    "vesper": {"accent": (255, 199, 153), "red": (255, 128, 128), "yellow": (255, 199, 153), "green": (153, 255, 228), "teal": (102, 221, 204), "blue": (176, 176, 176), "mauve": (255, 209, 168), "overlay0": (92, 92, 92), "surface0": (35, 35, 35)},
 }
 
 
-def theme_selection_bg():
-    """The active theme's surface0 RGB, honoring a [theme.custom] override."""
+def theme_palette():
+    """The active theme's palette, honoring [theme.custom] hex overrides."""
     path = os.environ.get("HERDR_CONFIG_PATH") or os.path.expanduser(
         "~/.config/herdr/config.toml")
-    name, custom = None, None
+    name, custom = None, {}
     try:
         import tomllib
         with open(path, "rb") as f:
             theme = tomllib.load(f).get("theme") or {}
         name = theme.get("name")
-        custom = (theme.get("custom") or {}).get("surface0")
+        custom = theme.get("custom") or {}
     except (OSError, ValueError, ImportError):
         pass
-    if isinstance(custom, str) and custom.startswith("#") and len(custom) == 7:
-        try:
-            return tuple(int(custom[i:i + 2], 16) for i in (1, 3, 5))
-        except ValueError:
-            pass
-    return _THEME_SURFACE0.get(name or "catppuccin")
+    pal = dict(_THEME_PALETTES.get(name or "catppuccin") or {})
+    for key, val in custom.items():
+        if isinstance(val, str) and val.startswith("#") and len(val) == 7:
+            try:
+                pal[key] = tuple(int(val[i:i + 2], 16) for i in (1, 3, 5))
+            except ValueError:
+                pass
+    return pal
 
 
 def _rgb_to_256(r, g, b):
@@ -280,20 +291,22 @@ def _rgb_to_256(r, g, b):
 
 
 def chat_emoji(r):
+    # Herdr's sidebar language: red=blocked, yellow=working,
+    # teal/blue=finished-unseen, green=idle/clear.
     if r["rank"] == "5":
         return "🏁"
     if r["status"] == "blocked":
         return "🔴"
     if r["rank"] == "1":
-        return "🟡"
+        return "🔵"
     if r["status"] == "working":
-        return "🟢"
+        return "🟡"
     if r["status"] == "idle":
-        return "⚪"
-    return "❔"
+        return "🟢"
+    return "⚪"
 
 
-_EMOJI_ORDER = ["🔴", "🟡", "🟢", "⚪", "🏁", "⚫", "❔"]
+_EMOJI_ORDER = ["🔴", "🔵", "🟡", "🟢", "🏁", "⚫", "⚪"]
 
 
 def _agg(emojis):
@@ -437,19 +450,28 @@ def counts_line(rows):
 def run(stdscr):
     curses.curs_set(0)
     curses.use_default_colors()
+    # Herdr's sidebar state language: blocked=red, working=yellow,
+    # done-unseen=teal, idle=green, unknown=overlay0. Basic-color fallbacks
+    # first, then the exact theme RGBs when the terminal has 256 colors.
     curses.init_pair(1, curses.COLOR_RED, -1)      # blocked
-    curses.init_pair(2, curses.COLOR_YELLOW, -1)   # done / unread
-    curses.init_pair(3, curses.COLOR_GREEN, -1)    # working
-    curses.init_pair(4, curses.COLOR_CYAN, -1)     # agent names / accents
-    curses.init_pair(5, curses.COLOR_BLUE, -1)     # folder icon
-    curses.init_pair(6, curses.COLOR_MAGENTA, -1)  # workspace names
-    # Selected row: theme surface0 background, like herdr's own sidebar.
+    curses.init_pair(2, curses.COLOR_YELLOW, -1)   # working
+    curses.init_pair(3, curses.COLOR_CYAN, -1)     # done / unread (teal)
+    curses.init_pair(7, curses.COLOR_GREEN, -1)    # idle / clear
+    curses.init_pair(4, curses.COLOR_CYAN, -1)     # agent names (blue)
+    curses.init_pair(5, curses.COLOR_BLUE, -1)     # pane dirs (accent)
+    curses.init_pair(6, curses.COLOR_MAGENTA, -1)  # workspace names (mauve)
     sel_pair = curses.A_REVERSE
-    bg = theme_selection_bg()
-    if bg and curses.COLORS >= 256:
+    pal = theme_palette()
+    if pal and curses.COLORS >= 256:
         try:
-            curses.init_pair(10, -1, _rgb_to_256(*bg))
-            sel_pair = curses.color_pair(10)
+            for pair, token in ((1, "red"), (2, "yellow"), (3, "teal"),
+                                (7, "green"), (4, "blue"), (5, "accent"),
+                                (6, "mauve")):
+                if token in pal:
+                    curses.init_pair(pair, _rgb_to_256(*pal[token]), -1)
+            if "surface0" in pal:
+                curses.init_pair(10, -1, _rgb_to_256(*pal["surface0"]))
+                sel_pair = curses.color_pair(10)
         except curses.error:
             pass
     curses.mousemask(curses.ALL_MOUSE_EVENTS)
@@ -499,10 +521,10 @@ def run(stdscr):
         first = max(0, min(sel_line - visible // 2, len(lines) - visible))
         FLAG_ATTR = {
             "!": curses.color_pair(1) | curses.A_BOLD,
-            "●": curses.color_pair(2) | curses.A_BOLD,
-            "▸": curses.color_pair(3),
+            "●": curses.color_pair(3) | curses.A_BOLD,   # finished-unseen: teal
+            "▸": curses.color_pair(2),                   # working: yellow
             "⚑": curses.A_DIM,
-            "○": curses.A_DIM,
+            "○": curses.color_pair(7),                   # idle: green
         }
 
         def seg(yy, x, s, attr):
@@ -566,9 +588,9 @@ def run(stdscr):
             if r["status"] == "blocked":
                 attr = curses.color_pair(1) | curses.A_BOLD
             elif r["rank"] == "1":
-                attr = curses.color_pair(2) | curses.A_BOLD
+                attr = curses.color_pair(3) | curses.A_BOLD   # done/unread: teal
             elif r["status"] == "working":
-                attr = curses.color_pair(3)
+                attr = curses.color_pair(2)                   # working: yellow
             elif r["rank"] == "5":
                 attr = curses.A_DIM
             selected = bool(row_idx and i == row_idx[sel])
