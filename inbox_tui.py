@@ -362,8 +362,7 @@ def run(stdscr):
             kind, item = lines[i]
             yy = top + y
             if kind == "ws":
-                x = seg(yy, 1, "📁", curses.color_pair(5)) + 2
-                x = seg(yy, x, item["workspace"],
+                x = seg(yy, 1, item["workspace"],
                         curses.color_pair(6) | curses.A_BOLD)
                 x = seg(yy, x, " — ", curses.A_DIM)
                 seg(yy, x, item["flags"], 0)
@@ -386,8 +385,7 @@ def run(stdscr):
                 continue
             if kind == "header":
                 yy = top + y
-                x = seg(yy, 1, "📁", curses.color_pair(5)) + 2  # emoji is 2 cols
-                x = seg(yy, x, item["workspace"],
+                x = seg(yy, 1, item["workspace"],
                         curses.color_pair(6) | curses.A_BOLD)
                 if item.get("flag"):
                     x = seg(yy, x, " — ", curses.A_DIM)
