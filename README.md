@@ -81,27 +81,36 @@ rows = [
 
 ```toml
 [[keys.command]]
-key = "prefix+m"          # settle focused agent
+key = "prefix+m"
 type = "shell"
+description = "settle agent (slides to bottom of inbox)"
 command = "herdr plugin action invoke settle --plugin herdr-agent-inbox"
 
 [[keys.command]]
-key = "prefix+shift+m"    # mark focused agent unread
+key = "prefix+shift+m"
 type = "shell"
+description = "mark agent unread (back to attention tier)"
 command = "herdr plugin action invoke unread --plugin herdr-agent-inbox"
 
 [[keys.command]]
-key = "prefix+alt+m"      # settle all finished agents in current workspace
+key = "prefix+alt+m"
 type = "shell"
+description = "settle all finished agents in workspace"
 command = "herdr plugin action invoke settle-workspace --plugin herdr-agent-inbox"
 
 [[keys.command]]
-key = "prefix+i"          # open the inbox popup
+key = "prefix+i"
 type = "shell"
+description = "open agent inbox popup"
 command = "herdr plugin pane open --plugin herdr-agent-inbox --entrypoint inbox"
 ```
 
-Then `herdr server reload-config`.
+The `description` fields make the bindings show up properly in the `prefix+?`
+help panel. Then `herdr server reload-config`.
+
+Sidebar width: there is no runtime resize — set `ui.sidebar_width` (default
+26; auto-scales) and raise `ui.sidebar_max_width` (default 36) so the
+`$title` rows get room; 34/44 works well.
 
 ## Notes / limitations
 
