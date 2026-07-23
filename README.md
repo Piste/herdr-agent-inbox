@@ -1,95 +1,85 @@
 # herdr-agent-inbox
 
-Treat herdr's Agents sidebar as an **inbox** — inspired by
-[T3 Code's "settle" workflow](https://x.com/theo/status/2079892861689254129):
+**An inbox for your coding agents.** Session titles, settle / mark-unread
+triage, running times, workspace rollups, and a ChatGPT-style resumable chat
+history — for every agent running in [herdr](https://herdr.dev).
+
+Inspired by [T3 Code's "settle" workflow](https://x.com/theo/status/2079892861689254129):
 
 > *"Think of it more like an inbox. When you're done with a thread, click the
 > 'settle' button and it slides to the bottom. This has helped me 'finish' more."*
 
-## What it does
+![Tree view — workspaces, directories, chats with live state and archived history](assets/tree.png)
 
-1. **Session titles** — every agent row gets a ChatGPT-style title derived from
-   the agent's native session transcript (first real user prompt; Claude Code
-   summaries when available). Works for claude, pi, codex (session-ref
-   dependent); falls back to the pane label / terminal title for others
-   (hermes profiles already have meaningful titles).
-2. **Inbox ordering with Settle / Mark unread** — the Agents panel is sorted by
-   attention tier, most recent first within each tier:
+## What you get
 
-   | rank | tier |
-   |------|------|
-   | 0 | `blocked` (needs input) |
-   | 1 | `done` (finished, unseen) or manually **marked unread** |
-   | 2 | `working` |
-   | 3 | `idle` (seen) |
-   | 5 | **settled** (reviewed, slid to the bottom) |
+- **Session titles** — every agent pane gets a real title derived from its
+  conversation ("Fix flaky payment webhook tests"), not just `claude` or a
+  directory name. Reads the agent's native transcript (claude / pi / codex),
+  optionally summarized by any LLM command you configure.
+- **Inbox triage** — the Agents sidebar becomes an attention queue: blocked →
+  finished-unseen → working → idle → **settled at the bottom**. Settle an
+  agent when you're done with it; it auto-reopens the moment it works again.
+  Mark one unread to pin it back on top.
+- **Chat history that accumulates** — closed conversations stay listed under
+  their workspace/directory (and in a global history browser), and the ones
+  with session refs **reopen in place** with `claude --resume` / `pi
+  --session` / `codex resume`.
+- **Running times** — how long each session has lived and how long it's been
+  in its current state, live in the sidebar.
+- **Workspace rollups** — each workspace row shows its agents by state
+  (`!1 ●2 ▸1 ⚑3`) plus the longest-running busy stint.
+- **Sidebar resize** — grow/shrink herdr's sidebar from the keyboard (and
+  keep herdr's native mouse-drag working).
 
-   Settling auto-clears the moment the agent starts working again or blocks.
-   A marked-unread flag clears when you focus the pane (after having left it).
-3. **Workspace rollups** — each space row can show `$agents`
-   (e.g. `!1 ●2 ▸1 ⚑3` = 1 blocked, 2 finished/unread, 1 working, 3 settled)
-   and `$busy` (longest currently-working stint).
-4. **Running time** — per-agent `$age` (how long this agent session has been in
-   the pane) and `$since` (time in its current state), refreshed every 30s.
+Everything runs through herdr's public plugin surface — no fork, no patches,
+stdlib Python only.
 
-## Architecture
+## The popup
 
-- `daemon.py` — stdlib-Python daemon started by the plugin `[[startup]]` hook.
-  Subscribes to herdr socket events (`pane.updated/created/closed/focused/
-  agent_detected`), diffs `agent.list`, and reports:
-  - `pane.report_metadata`: `title` + tokens `title`, `rank`, `age`, `since`, `flag`
-  - `workspace.report_metadata`: tokens `agents`, `busy`
-  - `agent.view.set`: sort `[{token:"rank"} asc, state_change_seq desc]`
-  - Control socket (`$HERDR_PLUGIN_STATE_DIR/control.sock`) for
-    settle/unread/retitle commands.
-  - State persists across server restarts in `state.json`, keyed by
-    `terminal_id` (stable across restore).
-- `actions.py` — keybindable plugin actions (settle, unread, settle-workspace,
-  retitle, restart-daemon).
-- `inbox_tui.py` — popup inbox (`[[panes]] id="inbox"`, placement popup):
-  j/k navigate, enter focus, `s` settle, `u` unread, `c` clear flag,
-  `S` settle all finished, `r` retitle, `g` group by workspace, `q` quit.
-  Mouse: left-click selects, double-click focuses, **right-click toggles
-  settle/unsettle** on the row under the cursor. (Herdr's native right-click
-  context menus are hardcoded in the client — `ContextMenuKind` in
-  `src/app/state.rs` — so a plugin cannot add "Settle" there; in-popup mouse
-  is the extension-route answer. Native menu items would need a herdr fork.)
+`prefix+i` opens the inbox. `g` rotates four views, `h` opens history.
 
-## Title configuration
+**Compact** — one line per chat, workspace headers with a dominant-state flag:
 
-`<herdr config dir>/plugins/config/herdr-agent-inbox/config.toml`
-(auto-created with comments on first run, hot-reloaded on change):
+![Compact view](assets/compact.png)
 
-```toml
-[title]
-source = "first"   # "first" opening prompt | "last" most recent prompt
-summarize = true   # pipe the prompt through summarize_cmd for a real title
-summarize_cmd = "claude -p --model claude-haiku-4-5-20251001 'Write a 4-8 word title for this coding-agent session request. Output ONLY the title, nothing else.'"
-summarize_timeout_secs = 60
-```
+**History** — every closed chat, newest first; `↩` means resumable:
 
-`source = "last"` re-derives the title whenever the agent finishes a turn.
-Summaries run on an async worker, are cached per prompt content (so each
-session is summarized once), and fall back to the truncated raw prompt until
-the summary lands or if the command fails.
+![History browser](assets/history.png)
 
-## Sidebar rollup legend ($agents)
+| Key | Action |
+|---|---|
+| `enter` / double-click | Focus the agent (or reopen an archived chat) |
+| `s` / right-click | Settle (right-click toggles) |
+| `u` | Mark unread |
+| `c` | Clear settle/unread flag |
+| `S` | Settle every finished agent |
+| `r` | Regenerate the title |
+| `g` | Rotate view: tree → compact → grouped → flat |
+| `h` | Chat history browser |
+| `q` / esc | Close |
 
-`!2` blocked · `●1` finished-unseen/unread · `▸3` working · `○2` idle ·
-`⚑1` settled. A workspace whose only content is a single idle agent shows
-nothing (the space's own status icon already conveys it). Idle is `○`
-rather than `·` because herdr joins sidebar row tokens with a `·` separator.
+### State legend
+
+`🔴` / `!` blocked · `🔵` / `●` finished, unseen · `🟡` / `▸` working ·
+`🟢` / `○` idle · `🏁` / `⚑` settled · `⚫` closed chat — matching herdr's
+own sidebar color language (red/teal/yellow/green), in your herdr theme's
+exact palette.
 
 ## Install
 
+Requires herdr ≥ 0.7.0 and `python3` (3.11+ recommended) on PATH.
+
 ```sh
-herdr plugin link ~/.config/herdr/plugins-dev/herdr-agent-inbox
-sh ~/.config/herdr/plugins-dev/herdr-agent-inbox/scripts/ensure-daemon.sh   # first time; afterwards [[startup]] handles it
+herdr plugin install douglascorrea/herdr-agent-inbox
 ```
 
-### Sidebar rows (config.toml)
+The daemon starts with your session (and a watchdog revives it). Then wire up
+the display and keys:
 
-The tokens only render if your sidebar rows reference them:
+### Sidebar rows (`~/.config/herdr/config.toml`)
+
+The plugin reports tokens; your sidebar config decides what renders:
 
 ```toml
 [ui.sidebar.agents]
@@ -100,14 +90,17 @@ rows = [
 
 [ui.sidebar.spaces]
 rows = [
-  ["state_icon", "workspace", { token = "$busy", dim = true }],
-  ["branch", "git_status", "$agents"],
+  ["state_icon", "workspace", "$agents", { token = "$busy", dim = true }],
+  ["branch", "git_status"],
 ]
-# Note: styled custom tokens keep the `$` prefix ({ token = "$flag", … });
-# builtins (state_icon, workspace, …) stay bare.
 ```
 
-### Keybindings (config.toml)
+Available pane tokens: `$title`, `$age` (session running time), `$since`
+(time in current state), `$flag` (⚑ settled / ● unread). Workspace tokens:
+`$agents` (state counts), `$busy` (longest working stint). Styled custom
+tokens keep the `$` prefix; builtins stay bare.
+
+### Keybindings
 
 ```toml
 [[keys.command]]
@@ -133,42 +126,73 @@ key = "prefix+i"
 type = "shell"
 description = "open agent inbox popup"
 command = "herdr plugin pane open --plugin herdr-agent-inbox --entrypoint inbox"
+
+[[keys.command]]
+key = "prefix+alt+right"
+type = "shell"
+description = "sidebar wider (+2 cols)"
+command = "herdr plugin action invoke sidebar-grow --plugin herdr-agent-inbox"
+
+[[keys.command]]
+key = "prefix+alt+left"
+type = "shell"
+description = "sidebar narrower (-2 cols)"
+command = "herdr plugin action invoke sidebar-shrink --plugin herdr-agent-inbox"
 ```
 
-The `description` fields make the bindings show up properly in the `prefix+?`
-help panel. Then `herdr server reload-config`.
+Then `herdr server reload-config`.
 
-### Sidebar resize (mouse + keyboard)
+## Title configuration
 
-**Mouse (native herdr, undocumented):** drag the sidebar's **last column**
-(the divider between sidebar and panes) with the left button. Herdr clamps
-the drag to `[sidebar_min_width, sidebar_max_width]` and persists the result
-in session state — so keep those bounds apart (e.g. 20/60). There's also a
-draggable divider between the spaces and agents sections.
+`<herdr config dir>/plugins/config/herdr-agent-inbox/config.toml`
+(auto-created with comments on first run, hot-reloaded on change):
 
-**Keyboard (plugin):** `sidebar-grow` / `sidebar-shrink` actions (bind to
-e.g. `prefix+alt+right` / `prefix+alt+left`), or an absolute width via
+```toml
+[title]
+source = "first"   # "first" opening prompt | "last" most recent prompt
+summarize = false  # pipe the prompt through summarize_cmd for a real title
+summarize_cmd = "claude -p --model claude-haiku-4-5-20251001 'Write a 4-8 word title for this coding-agent session request. Output ONLY the title, nothing else.'"
+summarize_timeout_secs = 60
+```
+
+`source = "last"` re-derives the title whenever the agent finishes a turn.
+Summaries run on an async worker, cached per prompt content (one call per
+session), falling back to the truncated raw prompt until they land. Agents
+without transcript refs (e.g. hermes) fall back to their pane/terminal title
+— which you can override anytime: the inbox's `r` regenerates, and the
+`set-title` control command pins a title of your choosing.
+
+**Privacy note:** titles are derived from your prompts. They are stored
+locally (plugin state dir) and rendered in your sidebar. If you enable
+`summarize`, prompt excerpts are piped to *whatever command you configure* —
+nothing leaves your machine unless that command sends it somewhere.
+
+## Sidebar resize
+
+Herdr's effective sidebar width is session state clamped by
+`sidebar_min_width`/`sidebar_max_width` (and herdr natively supports dragging
+the sidebar's last column with the mouse). The `sidebar-grow`/`sidebar-shrink`
+actions force an exact width by pinning the clamps and immediately relaxing
+them back to `[20, 60]`, so keyboard and mouse resize coexist. Absolute width:
 `python3 actions.py sidebar 36`.
 
-How the keyboard path works (verified on herdr 0.7.5): the live width is
-session state — config `sidebar_width` only applies when still config-owned —
-but the min/max clamps re-apply to it on every `reload-config`. So a resize
-runs two phases: pin `width = min = max = target` + reload (forces the live
-width), then relax the bounds back to `[20, 60]` + reload (restores mouse
-drag range). The baseline for `±2` is read from `session.json` (live value,
-where drags land) or the config file, whichever is fresher. Symlinked
-configs are edited through `os.path.realpath`, so a dotfiles symlink
-survives.
+## How it works
 
-## Notes / limitations
+- **`daemon.py`** — a stdlib-Python daemon started by the plugin's
+  `[[startup]]` hook. Subscribes to herdr socket events, diffs `agent.list`,
+  derives titles from native transcripts, and reports pane/workspace metadata
+  plus an `agent.view.set` inbox sort. Closed chats append to
+  `history.jsonl`. Settle/unread state lives in `state.json`, keyed by
+  terminal id, surviving restarts. A control socket serves the actions/TUI.
+- **`actions.py`** — the keybindable actions (settle, unread,
+  settle-workspace, retitle, set-title, sidebar resize, restart-daemon).
+- **`inbox_tui.py`** — the popup (`[[panes]]`, placement popup) with the four
+  views, mouse support, theme-matched colors, and the history browser.
+  Try it standalone with `python3 inbox_tui.py --demo`.
 
-- Sort is installed via `agent.view.set` (source `herdr-agent-inbox`) and
-  overrides `ui.agent_panel_sort` while active. `herdr agent view` has no CLI;
-  to remove it, stop the daemon and restart the herdr server, or send
-  `agent.view.clear` over the socket.
-- `$age` for agents that existed before the plugin was installed starts
-  counting from first sight, not the real session start.
-- Codex panes only get transcript titles when herdr reports a session ref for
-  them; otherwise they fall back to the pane/terminal title.
-- Requires `python3` on PATH (stdlib only). Logs:
-  `<plugin state dir>/daemon.log`.
+State lives next to your herdr session socket in `agent-inbox-state/`
+(`state.json`, `history.jsonl`, `daemon.log`, control socket).
+
+## License
+
+[MIT](LICENSE)
