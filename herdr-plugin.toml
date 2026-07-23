@@ -1,0 +1,60 @@
+# herdr-plugin.toml — manifest for herdr-agent-inbox.
+#
+# Inbox-style agent sidebar (inspired by T3 Code's "settle" workflow):
+# session titles, settle / mark-unread ordering, per-agent running time,
+# and per-workspace agent rollups. A small stdlib-Python daemon watches the
+# herdr socket API and reports pane/workspace metadata + an agent view sort.
+
+id = "herdr-agent-inbox"
+name = "herdr-agent-inbox"
+version = "0.1.0"
+description = "Inbox for agents: session titles, settle/mark-unread ordering, runtimes, workspace rollups."
+min_herdr_version = "0.7.0"
+platforms = ["linux", "macos"]
+
+# Start the daemon once the session is up; it flock-guards against duplicates.
+[[startup]]
+command = ["/bin/sh", "scripts/ensure-daemon.sh"]
+
+# Cheap watchdog: if the daemon died, any newly detected agent revives it.
+[[events]]
+on = "pane.agent_detected"
+command = ["/bin/sh", "scripts/ensure-daemon.sh"]
+
+[[actions]]
+id = "settle"
+title = "Settle agent"
+description = "Mark the focused agent as settled — it slides to the bottom of the Agents panel."
+command = ["python3", "actions.py", "settle"]
+
+[[actions]]
+id = "unread"
+title = "Mark agent unread"
+description = "Flag the focused agent back into the attention tier (like marking an email unread)."
+command = ["python3", "actions.py", "unread"]
+
+[[actions]]
+id = "settle-workspace"
+title = "Settle workspace"
+description = "Settle every finished (done/idle) agent in the current workspace."
+command = ["python3", "actions.py", "settle-workspace"]
+
+[[actions]]
+id = "retitle"
+title = "Regenerate session title"
+description = "Re-derive the focused agent's session title from its transcript."
+command = ["python3", "actions.py", "retitle"]
+
+[[actions]]
+id = "restart-daemon"
+title = "Restart inbox daemon"
+description = "Kill and restart the agent-inbox daemon."
+command = ["/bin/sh", "scripts/restart-daemon.sh"]
+
+[[panes]]
+id = "inbox"
+title = "Agent Inbox"
+placement = "popup"
+width = "80%"
+height = "70%"
+command = ["python3", "inbox_tui.py"]
