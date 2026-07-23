@@ -144,14 +144,21 @@ def load_config():
 class Log:
     def __init__(self, path):
         self.path = path
+        self._writes = 0
+        self._rotate()
+
+    def _rotate(self):
         try:
-            if os.path.exists(path) and os.path.getsize(path) > 1_000_000:
-                os.replace(path, path + ".1")
+            if os.path.exists(self.path) and os.path.getsize(self.path) > 1_000_000:
+                os.replace(self.path, self.path + ".1")
         except OSError:
             pass
 
     def __call__(self, msg):
         line = "%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
+        self._writes += 1
+        if self._writes % 500 == 0:  # long-running daemons rotate too
+            self._rotate()
         try:
             with open(self.path, "a") as f:
                 f.write(line)
@@ -175,7 +182,15 @@ def herdr_request(method, params, timeout=10.0):
             buf += chunk
     finally:
         s.close()
-    resp = json.loads(buf)
+    # Raise RuntimeError (not ValueError) for empty/truncated responses so
+    # every `except (OSError, RuntimeError)` call site survives a herdr
+    # restart mid-request.
+    if not buf:
+        raise RuntimeError("%s: connection closed without a reply" % method)
+    try:
+        resp = json.loads(buf)
+    except ValueError as e:
+        raise RuntimeError("%s: bad response: %s" % (method, e))
     if "error" in resp:
         raise RuntimeError("%s: %s" % (method, resp["error"]))
     return resp.get("result") or {}
@@ -313,13 +328,15 @@ def title_from_transcript(path, source="first"):
     try:
         if source == "last":
             # Transcript lines can be huge (base64 images in tool results), so
-            # widen the tail window until a user prompt shows up.
+            # widen the tail window until a user prompt shows up — but cap the
+            # read so a promptless multi-hundred-MB transcript can't be
+            # re-slurped whole on every tick.
             size = os.path.getsize(path)
             cap = 512 * 1024
             while True:
                 title, raw = _scan_lines_for_prompt(
                     reversed(_tail_lines(path, cap)), True)
-                if title or cap >= size:
+                if title or cap >= min(size, 32 * 1024 * 1024):
                     return title, raw
                 cap *= 4
         with open(path, "r", errors="replace") as f:
@@ -470,7 +487,13 @@ class InboxDaemon:
         drives the tree's ⚫ rows) and the durable history.jsonl (drives the
         ChatGPT-style history browser, resumable via stored session refs)."""
         hist = list(st.get("history") or [])
+        # A pane archived on "gone" that reappears and closes for real would
+        # archive the same chat twice — skip unchanged re-archives.
+        fingerprint = (st.get("sess_ref"), st.get("title"))
+        if fingerprint == tuple(st.get("_last_archived") or ()):
+            return hist
         if st.get("title"):
+            st["_last_archived"] = list(fingerprint)
             entry = {
                 "agent": st.get("agent"),
                 "title": st["title"],
@@ -494,8 +517,10 @@ class InboxDaemon:
             if os.path.exists(path) and os.path.getsize(path) > 400_000:
                 with open(path) as f:
                     tail = f.readlines()[-1000:]
-                with open(path, "w") as f:
+                tmp = path + ".tmp"
+                with open(tmp, "w") as f:
                     f.writelines(tail)
+                os.replace(tmp, path)  # atomic — readers never see a partial file
             with open(path, "a") as f:
                 f.write(json.dumps(entry) + "\n")
         except OSError as e:
@@ -603,6 +628,8 @@ class InboxDaemon:
                 ws_labels[wsr.get("workspace_id")] = wsr.get("label")
         except (OSError, RuntimeError, ValueError):
             pass
+        pending = []
+        ws_pending = []
         with self.lock:
             self.pane_to_tid = {}
             seen_tids = set()
@@ -668,31 +695,59 @@ class InboxDaemon:
                     "since": fmt_dur(now - st["last_change"]),
                     "flag": flag,
                 }
-                self._report_pane(pane_id, tid, st, tokens)
+                pending.append(self._pane_report_item(pane_id, tid, st, tokens))
 
                 ws = rec.get("workspace_id")
                 if ws:
                     ws_agents.setdefault(ws, []).append((status, st, now))
 
-            self._report_workspaces(ws_agents)
+            ws_pending = self._workspace_report_items(ws_agents)
             self._prune(seen_tids, now)
             self._save()
+        # Socket round-trips happen OUTSIDE the lock so control commands
+        # (settle/unread/…) never queue behind a slow herdr server.
+        for item in pending:
+            if item:
+                self._send_pane_report(*item)
+        for ws, tokens in ws_pending:
+            self._send_ws_report(ws, tokens)
 
-    def _report_pane(self, pane_id, tid, st, tokens):
+    def _pane_report_item(self, pane_id, tid, st, tokens):
         meta_title = st.get("title")  # only override the pane title if generated
         want = {"title": meta_title, "tokens": tokens}
         if self.last_report.get(tid) == want:
-            return
+            return None
         params = {"pane_id": pane_id, "source": SOURCE, "tokens": tokens}
         if meta_title:
             params["title"] = meta_title
+        return (pane_id, tid, params, want)
+
+    def _send_pane_report(self, pane_id, tid, params, want):
         try:
             herdr_request("pane.report_metadata", params)
-            self.last_report[tid] = want
+            with self.lock:
+                self.last_report[tid] = want
         except (OSError, RuntimeError) as e:
             self.log("report_metadata %s failed: %s" % (pane_id, e))
 
-    def _report_workspaces(self, ws_agents):
+    def _send_ws_report(self, ws, tokens):
+        try:
+            herdr_request(
+                "workspace.report_metadata",
+                {"workspace_id": ws, "source": SOURCE, "tokens": tokens},
+            )
+            with self.lock:
+                if tokens.get("agents") is None:
+                    self.ws_report.pop(ws, None)
+                else:
+                    self.ws_report[ws] = tokens
+        except (OSError, RuntimeError) as e:
+            self.log("ws metadata %s failed: %s" % (ws, e))
+
+    def _workspace_report_items(self, ws_agents):
+        """Compute per-workspace rollup tokens; returns [(ws, tokens)] for
+        entries that changed. Pure computation — no I/O (called under lock)."""
+        items = []
         now = time.time()
         for ws, entries in ws_agents.items():
             counts = {"blocked": 0, "attention": 0, "working": 0, "idle": 0, "settled": 0}
@@ -731,26 +786,12 @@ class InboxDaemon:
                 "agents": " ".join(pieces),
                 "busy": ("▸%s" % fmt_dur(busiest)) if busiest else "",
             }
-            if self.ws_report.get(ws) == tokens:
-                continue
-            try:
-                herdr_request(
-                    "workspace.report_metadata",
-                    {"workspace_id": ws, "source": SOURCE, "tokens": tokens},
-                )
-                self.ws_report[ws] = tokens
-            except (OSError, RuntimeError) as e:
-                self.log("ws metadata %s failed: %s" % (ws, e))
+            if self.ws_report.get(ws) != tokens:
+                items.append((ws, tokens))
         # Clear rollups for workspaces that no longer have agents.
         for ws in [w for w in self.ws_report if w not in ws_agents]:
-            try:
-                herdr_request(
-                    "workspace.report_metadata",
-                    {"workspace_id": ws, "source": SOURCE, "tokens": {"agents": None, "busy": None}},
-                )
-            except (OSError, RuntimeError):
-                pass
-            self.ws_report.pop(ws, None)
+            items.append((ws, {"agents": None, "busy": None}))
+        return items
 
     def _prune(self, seen_tids, now):
         for tid, st in list(self.terminals.items()):
@@ -774,6 +815,13 @@ class InboxDaemon:
     def handle_command(self, cmd):
         op = cmd.get("cmd")
         now = time.time()
+        agents = None
+        if op == "settle-workspace":
+            # Network fetch happens BEFORE taking the lock.
+            try:
+                agents = herdr_request("agent.list", {}).get("agents", [])
+            except (OSError, RuntimeError) as e:
+                return {"ok": False, "error": str(e)}
         with self.lock:
             if op in ("settle", "unread", "clear"):
                 tid = self.pane_to_tid.get(cmd.get("pane_id"))
@@ -794,10 +842,6 @@ class InboxDaemon:
             elif op == "settle-workspace":
                 ws = cmd.get("workspace_id")
                 n = 0
-                try:
-                    agents = herdr_request("agent.list", {}).get("agents", [])
-                except (OSError, RuntimeError) as e:
-                    return {"ok": False, "error": str(e)}
                 for rec in agents:
                     if rec.get("workspace_id") != ws:
                         continue
@@ -873,8 +917,11 @@ class InboxDaemon:
                     if not chunk:
                         break
                     data += chunk
-                resp = self.handle_command(json.loads(data))
-            except (ValueError, OSError) as e:
+                cmd = json.loads(data)
+                if not isinstance(cmd, dict):
+                    raise ValueError("command must be a JSON object")
+                resp = self.handle_command(cmd)
+            except Exception as e:  # the control thread must never die
                 resp = {"ok": False, "error": str(e)}
             try:
                 conn.sendall((json.dumps(resp) + "\n").encode())
@@ -894,6 +941,7 @@ class InboxDaemon:
         ]
         backoff = 1.0
         while not self.stop.is_set():
+            s = None
             try:
                 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 s.settimeout(5.0)
@@ -923,15 +971,16 @@ class InboxDaemon:
                     while b"\n" in buf:
                         line, buf = buf.split(b"\n", 1)
                         self._on_event(line)
-            except OSError as e:
+            except (OSError, RuntimeError) as e:
                 self.log("event stream down (%s); retrying in %.0fs" % (e, backoff))
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
             finally:
-                try:
-                    s.close()
-                except OSError:
-                    pass
+                if s is not None:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
 
     def _on_event(self, line):
         try:

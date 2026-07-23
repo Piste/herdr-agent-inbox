@@ -137,7 +137,7 @@ def _write_sidebar_bounds(width, mn, mx):
                        capture_output=True, text=True)
     try:
         diags = json.loads(r.stdout)["result"].get("diagnostics") or []
-    except (ValueError, KeyError):
+    except (ValueError, KeyError, TypeError, AttributeError):
         diags = ["reload-config failed: %s" % (r.stderr or r.stdout)]
     return "; ".join(diags) if diags else None
 
@@ -152,20 +152,34 @@ def sidebar_resize(spec):
     bounds back to [DRAG_MIN, DRAG_MAX] so herdr's native mouse drag on the
     sidebar divider (its last column) keeps room to move.
     """
-    base = _live_sidebar_width()
-    if base is None:
-        base = 34
-    if spec.startswith(("+", "-")):
-        new = base + int(spec)
-    else:
-        new = int(spec)
-    new = max(SIDEBAR_FLOOR, min(SIDEBAR_CEIL, new))
+    # Serialize concurrent resize invocations (rapid keypresses) — an
+    # unlocked read-modify-write of config.toml would interleave.
+    import fcntl
+    lock_dir = state_dir()
+    os.makedirs(lock_dir, exist_ok=True)
+    lock = open(os.path.join(lock_dir, "resize.lock"), "a")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        base = _live_sidebar_width()
+        if base is None:
+            base = 34
+        if spec.startswith(("+", "-")):
+            new = base + int(spec)
+        else:
+            new = int(spec)
+        new = max(SIDEBAR_FLOOR, min(SIDEBAR_CEIL, new))
 
-    err = _write_sidebar_bounds(new, new, new)          # force the live width
-    if err:
-        return None, err
-    err = _write_sidebar_bounds(new, min(DRAG_MIN, new), max(DRAG_MAX, new))
-    return new, err
+        err = _write_sidebar_bounds(new, new, new)      # force the live width
+        if err:
+            # Never leave the bounds pinned — that would disable herdr's
+            # native mouse drag on the sidebar divider.
+            _write_sidebar_bounds(new, min(DRAG_MIN, new), max(DRAG_MAX, new))
+            return None, err
+        err = _write_sidebar_bounds(new, min(DRAG_MIN, new), max(DRAG_MAX, new))
+        return new, err
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
 
 
 def main():

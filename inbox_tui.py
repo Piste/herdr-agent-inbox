@@ -25,6 +25,27 @@ import socket
 import subprocess
 import sys
 import time
+import unicodedata
+
+
+def _cwidth(ch):
+    return 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+
+
+def _wwidth(s):
+    return sum(_cwidth(ch) for ch in s)
+
+
+def _wtrunc(s, cols):
+    """Truncate s to at most `cols` display columns (emoji are 2 wide)."""
+    out, used = [], 0
+    for ch in s:
+        cw = _cwidth(ch)
+        if used + cw > cols:
+            break
+        out.append(ch)
+        used += cw
+    return "".join(out)
 
 SOURCE = "herdr-agent-inbox"
 
@@ -37,10 +58,49 @@ STATUS_ICON = {
 }
 
 
+DEMO = "--demo" in sys.argv
+
+
 def herdr_socket_path():
     return os.environ.get("HERDR_SOCKET_PATH") or os.path.expanduser(
         "~/.config/herdr/herdr.sock"
     )
+
+
+def _demo_rows():
+    mk = lambda i, ws, wsl, tab, cwd, agent, status, rank, title, age, flag="": {
+        "pane_id": "w%d:p1" % i, "tab_id": "%s:t1" % ws, "terminal_id": "t%d" % i,
+        "cwd": cwd, "workspace_id": ws, "ws_order": i, "workspace": wsl,
+        "agent": agent, "status": status, "seq": 100 - i, "title": title,
+        "rank": rank, "age": age, "since": age, "flag": flag,
+    }
+    return [
+        mk(1, "w1", "webapp", "t1", "/Users/dev/webapp", "claude", "blocked", "0",
+           "Add OAuth login flow with refresh tokens", "12m"),
+        mk(2, "w2", "api", "t2", "/Users/dev/api", "codex", "done", "1",
+           "Fix flaky payment webhook tests", "1h04m"),
+        mk(3, "w1", "webapp", "t1", "/Users/dev/webapp", "pi", "working", "2",
+           "Migrate database to Postgres 17", "26m"),
+        mk(4, "w3", "dotfiles", "t3", "/Users/dev/dotfiles", "codex", "working", "2",
+           "Refactor zsh prompt into modules", "8m"),
+        mk(5, "w4", "blog", "t4", "/Users/dev/blog", "claude", "idle", "3",
+           "Write post: terminal multiplexers in 2026", "2h11m"),
+        mk(6, "w2", "api", "t2", "/Users/dev/api", "hermes", "idle", "5",
+           "Rate-limit the public endpoints", "3h40m", "⚑"),
+    ]
+
+
+def _demo_history():
+    return [
+        {"agent": "claude", "title": "Design the billing schema", "closed": 1784800000,
+         "workspace_id": "w2", "workspace": "api", "cwd": "/Users/dev/api",
+         "sess_kind": "id", "sess_value": "demo-1"},
+        {"agent": "pi", "title": "Spike: switch bundler to rolldown", "closed": 1784790000,
+         "workspace_id": "w1", "workspace": "webapp", "cwd": "/Users/dev/webapp",
+         "sess_kind": "path", "sess_value": "/tmp/demo.jsonl"},
+        {"agent": "codex", "title": "Fix dark-mode contrast issues", "closed": 1784780000,
+         "workspace_id": "w1", "workspace": "webapp", "cwd": "/Users/dev/webapp"},
+    ]
 
 
 def herdr_request(method, params, timeout=6.0):
@@ -58,13 +118,20 @@ def herdr_request(method, params, timeout=6.0):
             buf += chunk
     finally:
         s.close()
-    resp = json.loads(buf)
+    if not buf:
+        raise RuntimeError("herdr closed the connection without replying")
+    try:
+        resp = json.loads(buf)
+    except ValueError as e:
+        raise RuntimeError("bad response from herdr: %s" % e)
     if "error" in resp:
         raise RuntimeError(str(resp["error"]))
     return resp.get("result") or {}
 
 
 def control_send(cmd):
+    if DEMO:
+        return {"ok": True, "title": "(demo)"}
     # Must match daemon.py: state dir derived from the session socket.
     p = os.path.join(os.path.dirname(herdr_socket_path()), "agent-inbox-state")
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -84,6 +151,8 @@ def control_send(cmd):
 
 
 def load_agents():
+    if DEMO:
+        return _demo_rows()
     agents = herdr_request("agent.list", {}).get("agents", [])
     ws_labels = {}
     ws_order = {}
@@ -122,6 +191,8 @@ _TAB_CACHE = {"ts": 0.0, "labels": {}}
 
 
 def tab_labels(workspace_ids):
+    if DEMO:
+        return {"w1:t1": "feature", "w2:t1": "hotfix", "w3:t1": "1", "w4:t1": "1"}
     now = time.time()
     if now - _TAB_CACHE["ts"] > 15:
         labels = {}
@@ -150,6 +221,8 @@ def load_history():
 
 def load_hist_entries():
     """Archived chats from the daemon's history.jsonl, newest first."""
+    if DEMO:
+        return _demo_history()
     p = os.path.join(os.path.dirname(herdr_socket_path()),
                      "agent-inbox-state", "history.jsonl")
     entries = []
@@ -204,6 +277,8 @@ def do_resume(entry):
     """Reopen an archived chat: split near where it lived (or recreate its
     workspace) and launch the agent's native resume command. Returns an
     error string, or None on success."""
+    if DEMO:
+        return "demo mode — resume disabled"
     cmd = resume_cmd(entry)
     if not cmd:
         return "no resumable session ref for this chat"
@@ -300,6 +375,13 @@ def _rgb_to_256(r, g, b):
     return (232 + gray) if gray_dist < cube_dist else cube_idx
 
 
+def _sel_key_of(line):
+    kind, item = line
+    if kind == "row":
+        return ("row", item.get("pane_id"))
+    return ("arch", item.get("sess_value") or item.get("closed"))
+
+
 def chat_emoji(r):
     # Herdr's sidebar language: red=blocked, yellow=working,
     # teal/blue=finished-unseen, green=idle/clear.
@@ -366,23 +448,19 @@ def build_tree(rows, archive):
         pane_x = 5 if multi_tab else 3  # dedent when the tab row is hidden
         seen_dirs = set()
         for tab_id, dirs in tabs_by_ws[ws].items():
-            tab_emojis = []
             tab_lines = []
             for cwd, chats in dirs.items():
                 seen_dirs.add(cwd)
                 closed = closed_by_dir.get((ws, cwd), [])[:CLOSED_PER_DIR]
-                pane_emojis = [chat_emoji(c) for c in chats] + (["⚫"] if closed else [])
                 tab_lines.append(("pane", {"cwd": _short_cwd(chats[0]["cwd"]),
-                                           "flags": _agg(pane_emojis), "x": pane_x}))
+                                           "x": pane_x}))
                 for c in chats:
                     c["_x"] = pane_x + 2
                     tab_lines.append(("row", c))
                 for h in closed:
                     tab_lines.append(("closed", dict(h, x=pane_x + 2)))
-                tab_emojis.extend(pane_emojis)
             if multi_tab:  # a single tab adds no information
-                tab_lines.insert(0, ("tab", {"label": tlabels.get(tab_id, tab_id or "?"),
-                                             "flags": _agg(tab_emojis)}))
+                tab_lines.insert(0, ("tab", {"label": tlabels.get(tab_id, tab_id or "?")}))
             ws_lines.extend(tab_lines)
         # Directories whose panes are gone but whose chats live on in the
         # archive — the Codex-app style accumulated list.
@@ -390,8 +468,7 @@ def build_tree(rows, archive):
                                         key=lambda kv: -(kv[1][0].get("closed") or 0)):
             if aws != ws or not cwd or cwd in seen_dirs:
                 continue
-            ws_lines.append(("pane", {"cwd": _short_cwd(cwd), "flags": "⚫",
-                                      "x": pane_x}))
+            ws_lines.append(("pane", {"cwd": _short_cwd(cwd), "x": pane_x}))
             for h in group[:CLOSED_PER_DIR]:
                 ws_lines.append(("closed", dict(h, x=pane_x + 2)))
         lines.append(("ws", {"workspace": rows_ws_label(rows, ws)}))
@@ -482,22 +559,25 @@ def counts_line(rows):
 
 
 def run(stdscr):
-    curses.curs_set(0)
-    curses.use_default_colors()
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
     # Herdr's sidebar state language: blocked=red, working=yellow,
     # done-unseen=teal, idle=green, unknown=overlay0. Basic-color fallbacks
     # first, then the exact theme RGBs when the terminal has 256 colors.
-    curses.init_pair(1, curses.COLOR_RED, -1)      # blocked
-    curses.init_pair(2, curses.COLOR_YELLOW, -1)   # working
-    curses.init_pair(3, curses.COLOR_CYAN, -1)     # done / unread (teal)
-    curses.init_pair(7, curses.COLOR_GREEN, -1)    # idle / clear
-    curses.init_pair(4, curses.COLOR_CYAN, -1)     # agent names (blue)
-    curses.init_pair(5, curses.COLOR_BLUE, -1)     # pane dirs (accent)
-    curses.init_pair(6, curses.COLOR_MAGENTA, -1)  # workspace names (mauve)
     sel_pair = curses.A_REVERSE
-    pal = theme_palette()
-    if pal and curses.COLORS >= 256:
-        try:
+    try:
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_RED, -1)      # blocked
+        curses.init_pair(2, curses.COLOR_YELLOW, -1)   # working
+        curses.init_pair(3, curses.COLOR_CYAN, -1)     # done / unread (teal)
+        curses.init_pair(7, curses.COLOR_GREEN, -1)    # idle / clear
+        curses.init_pair(4, curses.COLOR_CYAN, -1)     # agent names (blue)
+        curses.init_pair(5, curses.COLOR_BLUE, -1)     # pane dirs (accent)
+        curses.init_pair(6, curses.COLOR_MAGENTA, -1)  # workspace names (mauve)
+        pal = theme_palette()
+        if pal and curses.COLORS >= 256:
             for pair, token in ((1, "red"), (2, "yellow"), (3, "teal"),
                                 (7, "green"), (4, "blue"), (5, "accent"),
                                 (6, "mauve")):
@@ -506,8 +586,8 @@ def run(stdscr):
             if "surface0" in pal:
                 curses.init_pair(10, -1, _rgb_to_256(*pal["surface0"]))
                 sel_pair = curses.color_pair(10)
-        except curses.error:
-            pass
+    except curses.error:
+        pass
     curses.mousemask(curses.ALL_MOUSE_EVENTS)
     stdscr.timeout(2000)  # refresh every 2s when idle
 
@@ -517,6 +597,7 @@ def run(stdscr):
         mode = "tree"
     hist_mode = False
     sel = 0
+    sel_key = None
     status_msg = ""
     rows = []
 
@@ -536,6 +617,13 @@ def run(stdscr):
                    if kind in ("row", "hist", "closed")]
         if row_idx:
             sel = max(0, min(sel, len(row_idx) - 1))
+            # Background refreshes re-sort the list; keep the selection on
+            # the same item, not the same position.
+            if sel_key is not None:
+                for pos, li in enumerate(row_idx):
+                    if _sel_key_of(lines[li]) == sel_key:
+                        sel = pos
+                        break
 
         h, w = stdscr.getmaxyx()
         stdscr.erase()
@@ -546,8 +634,14 @@ def run(stdscr):
             header = " Agent Inbox — %s" % counts_line(rows)
             help_line = (" enter:focus  s:settle  u:unread  c:clear  S:settle-finished"
                          "  r:retitle  g:view  h:history  q:quit  |  right-click: settle")
-        stdscr.addnstr(0, 0, header.ljust(w - 1), w - 1, curses.A_BOLD)
-        stdscr.addnstr(h - 1, 0, (status_msg or help_line).ljust(w - 1), w - 1, curses.A_DIM)
+        if err:
+            header += "  (herdr unreachable — showing stale data)"
+        try:
+            stdscr.addnstr(0, 0, _wtrunc(header, w - 1).ljust(w - 1), 2 * w, curses.A_BOLD)
+            stdscr.addnstr(h - 1, 0, _wtrunc(status_msg or help_line, w - 2), 2 * w,
+                           curses.A_DIM)
+        except curses.error:
+            pass
 
         top = 1
         visible = h - 2
@@ -563,9 +657,16 @@ def run(stdscr):
         }
 
         def seg(yy, x, s, attr):
+            # Truncate and advance by DISPLAY width (emoji occupy 2 columns);
+            # never write into the bottom-right cell (curses raises there).
             if x < w - 1 and s:
-                stdscr.addnstr(yy, x, s, w - 1 - x, attr)
-            return x + len(s)
+                cols = w - 1 - x
+                s = _wtrunc(s, cols)
+                try:
+                    stdscr.addnstr(yy, x, s, cols * 2, attr)
+                except curses.error:
+                    pass
+            return x + _wwidth(s)
 
         def pick(base, on):
             # Selected rows use the theme highlight pair; curses pairs can't
@@ -680,6 +781,13 @@ def run(stdscr):
         if ch == ord("h"):
             hist_mode = not hist_mode
             sel = 0
+            sel_key = None
+            continue
+        if ch == ord("g") and not hist_mode:
+            mode = VIEW_MODES[(VIEW_MODES.index(mode) + 1) % len(VIEW_MODES)]
+            prefs["view"] = mode
+            save_prefs(prefs)
+            status_msg = " view: %s" % mode
             continue
         if ch == curses.KEY_MOUSE:
             try:
@@ -694,6 +802,7 @@ def run(stdscr):
             row = lines[i][1]
             if i in row_idx:
                 sel = row_idx.index(i)
+                sel_key = _sel_key_of(lines[i])
             if lines[i][0] in ("hist", "closed"):
                 if bstate & curses.BUTTON1_DOUBLE_CLICKED:
                     err = do_resume(row)
@@ -722,13 +831,10 @@ def run(stdscr):
         cur_kind, cur = lines[row_idx[sel]]
         if ch in (ord("j"), curses.KEY_DOWN):
             sel = min(sel + 1, len(row_idx) - 1)
+            sel_key = _sel_key_of(lines[row_idx[sel]])
         elif ch in (ord("k"), curses.KEY_UP):
             sel = max(sel - 1, 0)
-        elif ch == ord("g") and not hist_mode:
-            mode = VIEW_MODES[(VIEW_MODES.index(mode) + 1) % len(VIEW_MODES)]
-            prefs["view"] = mode
-            save_prefs(prefs)
-            status_msg = " view: %s" % mode
+            sel_key = _sel_key_of(lines[row_idx[sel]])
         elif ch == 10:  # enter
             if cur_kind in ("hist", "closed"):
                 err = do_resume(cur)
@@ -768,9 +874,9 @@ def main():
         pass
     except Exception:
         import traceback
-        p = os.path.join(os.path.dirname(herdr_socket_path()),
-                         "agent-inbox-state", "tui-crash.log")
-        with open(p, "a") as f:
+        d = os.path.join(os.path.dirname(herdr_socket_path()), "agent-inbox-state")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "tui-crash.log"), "a") as f:
             traceback.print_exc(file=f)
         raise
     return 0
