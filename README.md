@@ -108,9 +108,23 @@ command = "herdr plugin pane open --plugin herdr-agent-inbox --entrypoint inbox"
 The `description` fields make the bindings show up properly in the `prefix+?`
 help panel. Then `herdr server reload-config`.
 
-Sidebar width: there is no runtime resize — set `ui.sidebar_width` (default
-26; auto-scales) and raise `ui.sidebar_max_width` (default 36) so the
-`$title` rows get room; 34/44 works well.
+### Sidebar resize (runtime)
+
+Herdr has no native runtime sidebar resize, so the plugin provides one: the
+`sidebar-grow` / `sidebar-shrink` actions (bind to e.g. `prefix+alt+right` /
+`prefix+alt+left`) rewrite the sidebar width in `config.toml` and run
+`herdr server reload-config`. Symlinked configs are edited through
+`os.path.realpath`, so a dotfiles symlink survives.
+
+How it actually works (verified on herdr 0.7.5): the effective width is
+`clamp(auto_scale_from_content, sidebar_min_width, sidebar_max_width)` —
+`sidebar_width` itself is only a launch-time default and changing it alone
+does nothing to a live client, but the min/max clamps re-apply on reload.
+So resizing **pins `sidebar_width = min = max = target`** for an exact,
+immediate width. Trade-off: auto-scaling is disabled while pinned; restore
+it by hand-editing min/max apart again.
+
+An absolute width also works: `python3 actions.py sidebar 36`.
 
 ## Notes / limitations
 

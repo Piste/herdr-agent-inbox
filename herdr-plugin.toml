@@ -46,6 +46,18 @@ description = "Re-derive the focused agent's session title from its transcript."
 command = ["python3", "actions.py", "retitle"]
 
 [[actions]]
+id = "sidebar-grow"
+title = "Sidebar wider"
+description = "Grow the sidebar by 2 columns (rewrites ui.sidebar_width + reload-config)."
+command = ["python3", "actions.py", "sidebar", "+2"]
+
+[[actions]]
+id = "sidebar-shrink"
+title = "Sidebar narrower"
+description = "Shrink the sidebar by 2 columns (rewrites ui.sidebar_width + reload-config)."
+command = ["python3", "actions.py", "sidebar", "-2"]
+
+[[actions]]
 id = "restart-daemon"
 title = "Restart inbox daemon"
 description = "Kill and restart the agent-inbox daemon."

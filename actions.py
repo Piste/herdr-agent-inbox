@@ -6,14 +6,25 @@ context from HERDR_PLUGIN_CONTEXT_JSON and forwards the command to the daemon's
 control socket, starting the daemon first if it isn't running.
 
 Usage: actions.py <settle|unread|retitle|settle-workspace> [pane_id]
+       actions.py sidebar <+N|-N|N>
+
+`sidebar` is herdr's missing runtime sidebar resize: herdr only sizes the
+sidebar from config (ui.sidebar_width, clamped by min/max), so this rewrites
+that one line in config.toml and asks the server to reload. Writes go through
+os.path.realpath so a symlinked config (e.g. into dotfiles) is edited in
+place rather than replaced by a regular file.
 """
 
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
 import time
+
+SIDEBAR_FLOOR = 10
+SIDEBAR_CEIL = 80
 
 
 def state_dir():
@@ -57,11 +68,85 @@ def notify(title, body=None, sound=None):
     subprocess.run(argv, check=False, capture_output=True)
 
 
+def config_path():
+    p = os.environ.get("HERDR_CONFIG_PATH") or os.path.expanduser(
+        "~/.config/herdr/config.toml"
+    )
+    return os.path.realpath(p)
+
+
+def sidebar_resize(spec):
+    """spec: '+2', '-2', or an absolute column count like '30'.
+
+    Herdr computes the effective sidebar width as
+    clamp(auto_scale_from_content, sidebar_min_width, sidebar_max_width);
+    `sidebar_width` is only a launch-time default and changing it alone does
+    nothing to a live client (verified on 0.7.5). The clamps DO re-apply on
+    reload-config, so resizing pins min = max = target for an exact width.
+    Restore auto-scaling by hand-editing min/max apart again.
+    """
+    path = config_path()
+    with open(path, "r") as f:
+        text = f.read()
+
+    def get(key):
+        m = re.search(r"(?m)^(\s*%s\s*=\s*)(\d+)" % key, text)
+        return m, (int(m.group(2)) if m else None)
+
+    m_w, width = get("sidebar_width")
+    m_min, cur_min = get("sidebar_min_width")
+    m_max, cur_max = get("sidebar_max_width")
+    if not (m_w and m_min and m_max):
+        return None, "sidebar_width/min/max not all present in %s" % path
+
+    # Once pinned, min == max == current width; before that, sidebar_width
+    # is the best nominal baseline we have.
+    base = cur_min if cur_min == cur_max else width
+    if spec.startswith(("+", "-")):
+        new = base + int(spec)
+    else:
+        new = int(spec)
+    new = max(SIDEBAR_FLOOR, min(SIDEBAR_CEIL, new))
+    if new == base == cur_min == cur_max:
+        return base, None
+
+    # Replace right-to-left so earlier match offsets stay valid.
+    for m in sorted((m_w, m_min, m_max), key=lambda m: -m.start(2)):
+        text = text[: m.start(2)] + str(new) + text[m.end(2):]
+
+    tmp = path + ".agent-inbox.tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+    herdr = os.environ.get("HERDR_BIN_PATH", "herdr")
+    r = subprocess.run([herdr, "server", "reload-config"],
+                       capture_output=True, text=True)
+    try:
+        diags = json.loads(r.stdout)["result"].get("diagnostics") or []
+    except (ValueError, KeyError):
+        diags = ["reload-config failed: %s" % (r.stderr or r.stdout)]
+    return new, ("; ".join(diags) if diags else None)
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__, file=sys.stderr)
         return 2
     op = sys.argv[1]
+
+    if op == "sidebar":
+        if len(sys.argv) < 3:
+            print("usage: actions.py sidebar <+N|-N|N>", file=sys.stderr)
+            return 2
+        try:
+            new, err = sidebar_resize(sys.argv[2])
+        except (OSError, ValueError) as e:
+            new, err = None, str(e)
+        if err:
+            notify("agent-inbox: sidebar resize failed", body=err)
+            return 1
+        return 0
     ctx = {}
     try:
         ctx = json.loads(os.environ.get("HERDR_PLUGIN_CONTEXT_JSON") or "{}")
