@@ -162,8 +162,18 @@ def load_hist_entries():
                     pass
     except OSError:
         pass
-    entries.reverse()
-    return entries
+    entries.reverse()  # newest first
+    # A chat resumed and closed again re-archives under the same session
+    # ref — keep only the newest entry per session.
+    seen, uniq = set(), []
+    for e in entries:
+        key = (e.get("agent"), e.get("sess_value")) if e.get("sess_value") \
+            else id(e)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(e)
+    return uniq
 
 
 def resume_cmd(entry):
@@ -319,8 +329,17 @@ def _short_cwd(cwd):
     return ("~" + cwd[len(home):]) if cwd.startswith(home) else cwd
 
 
-def build_tree(rows, history):
-    """workspace → tab → pane(cwd) → chats (live + closed) hierarchy."""
+CLOSED_PER_DIR = 5
+
+
+def build_tree(rows, archive):
+    """workspace → tab → directory → chats hierarchy.
+
+    Live chats come from agent.list; closed chats accumulate from the
+    durable archive (history.jsonl), ChatGPT-style: they stay listed under
+    their workspace/directory even after their pane is gone, newest first,
+    capped per directory. Closed rows are selectable and resumable.
+    """
     lines = []
     tabs_by_ws = {}
     ws_rank = {}
@@ -331,22 +350,27 @@ def build_tree(rows, history):
         tabs.setdefault(r["tab_id"], {}).setdefault(r["cwd"], []).append(r)
         ws_rank[r["workspace_id"]] = min(r["ws_order"],
                                          ws_rank.get(r["workspace_id"], 999))
+    # Archived chats grouped by (workspace, cwd). Only open workspaces show
+    # in the tree — the full global archive lives under 'h'.
+    closed_by_dir = {}
+    for e in archive:
+        closed_by_dir.setdefault((e.get("workspace_id"), e.get("cwd")), []).append(e)
+    for group in closed_by_dir.values():
+        group.sort(key=lambda e: -(e.get("closed") or 0))
     # Same order as the sidebar's spaces list.
     ws_order = sorted(tabs_by_ws, key=lambda w: ws_rank[w])
     tlabels = tab_labels(ws_order)
     for ws in ws_order:
-        ws_emojis = []
         ws_lines = []
         multi_tab = len(tabs_by_ws[ws]) > 1
         pane_x = 5 if multi_tab else 3  # dedent when the tab row is hidden
+        seen_dirs = set()
         for tab_id, dirs in tabs_by_ws[ws].items():
             tab_emojis = []
             tab_lines = []
             for cwd, chats in dirs.items():
-                closed = []
-                for c in chats:
-                    for h in (history.get(c["terminal_id"]) or []):
-                        closed.append(h)
+                seen_dirs.add(cwd)
+                closed = closed_by_dir.get((ws, cwd), [])[:CLOSED_PER_DIR]
                 pane_emojis = [chat_emoji(c) for c in chats] + (["⚫"] if closed else [])
                 tab_lines.append(("pane", {"cwd": _short_cwd(chats[0]["cwd"]),
                                            "flags": _agg(pane_emojis), "x": pane_x}))
@@ -360,9 +384,17 @@ def build_tree(rows, history):
                 tab_lines.insert(0, ("tab", {"label": tlabels.get(tab_id, tab_id or "?"),
                                              "flags": _agg(tab_emojis)}))
             ws_lines.extend(tab_lines)
-            ws_emojis.extend(tab_emojis)
-        lines.append(("ws", {"workspace": rows_ws_label(rows, ws),
-                             "flags": _agg(ws_emojis)}))
+        # Directories whose panes are gone but whose chats live on in the
+        # archive — the Codex-app style accumulated list.
+        for (aws, cwd), group in sorted(closed_by_dir.items(),
+                                        key=lambda kv: -(kv[1][0].get("closed") or 0)):
+            if aws != ws or not cwd or cwd in seen_dirs:
+                continue
+            ws_lines.append(("pane", {"cwd": _short_cwd(cwd), "flags": "⚫",
+                                      "x": pane_x}))
+            for h in group[:CLOSED_PER_DIR]:
+                ws_lines.append(("closed", dict(h, x=pane_x + 2)))
+        lines.append(("ws", {"workspace": rows_ws_label(rows, ws)}))
         lines.extend(ws_lines)
     return lines
 
@@ -497,10 +529,11 @@ def run(stdscr):
         if hist_mode:
             lines = [("hist", e) for e in load_hist_entries()]
         elif mode == "tree":
-            lines = build_tree(rows, load_history())
+            lines = build_tree(rows, load_hist_entries())
         else:
             lines = build_lines(rows, mode)
-        row_idx = [i for i, (kind, _) in enumerate(lines) if kind in ("row", "hist")]
+        row_idx = [i for i, (kind, _) in enumerate(lines)
+                   if kind in ("row", "hist", "closed")]
         if row_idx:
             sel = max(0, min(sel, len(row_idx) - 1))
 
@@ -568,10 +601,14 @@ def run(stdscr):
                 seg(yy, x, meta, pick(curses.A_DIM, on))
                 continue
             if kind == "closed":
+                on = bool(row_idx and i == row_idx[sel])
+                if on:
+                    stdscr.addnstr(yy, 0, " " * (w - 1), w - 1, sel_pair)
                 x = seg(yy, item.get("x", 7), "%s: %s" % (item.get("agent", "?"),
                                                           item.get("title", "")),
-                        curses.A_DIM)
-                seg(yy, x, " — ⚫", curses.A_DIM)
+                        pick(curses.A_DIM, on))
+                seg(yy, x, " — ⚫%s" % ("  ↩" if resume_cmd(item) else ""),
+                    pick(curses.A_DIM, on))
                 continue
             if kind == "header":
                 yy = top + y
@@ -652,12 +689,12 @@ def run(stdscr):
             i = first + (my - top)
             if not (0 <= my - top < visible and 0 <= i < len(lines)):
                 continue
-            if lines[i][0] not in ("row", "hist"):
+            if lines[i][0] not in ("row", "hist", "closed"):
                 continue
             row = lines[i][1]
             if i in row_idx:
                 sel = row_idx.index(i)
-            if lines[i][0] == "hist":
+            if lines[i][0] in ("hist", "closed"):
                 if bstate & curses.BUTTON1_DOUBLE_CLICKED:
                     err = do_resume(row)
                     if err:
@@ -693,7 +730,7 @@ def run(stdscr):
             save_prefs(prefs)
             status_msg = " view: %s" % mode
         elif ch == 10:  # enter
-            if cur_kind == "hist":
+            if cur_kind in ("hist", "closed"):
                 err = do_resume(cur)
                 if err:
                     status_msg = " " + err
@@ -706,7 +743,7 @@ def run(stdscr):
                 continue
             return
         elif ch in (ord("s"), ord("u"), ord("r"), ord("c")):
-            if cur_kind == "hist":
+            if cur_kind in ("hist", "closed"):
                 status_msg = " archived chat — enter reopens it"
                 continue
             op = {"s": "settle", "u": "unread", "r": "retitle", "c": "clear"}[chr(ch)]
