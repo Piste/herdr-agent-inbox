@@ -73,7 +73,15 @@ def state_dir():
     # from the session socket keeps every entry point on the same control
     # socket and state file.
     p = os.path.join(os.path.dirname(herdr_socket_path()), "agent-inbox-state")
-    os.makedirs(p, exist_ok=True)
+    os.makedirs(p, mode=0o700, exist_ok=True)
+    try:
+        # State holds prompt-derived titles and project paths — private.
+        # makedirs won't tighten a pre-existing dir, so chmod explicitly
+        # (this also gates control.sock on platforms where AF_UNIX connect
+        # is governed by directory permissions).
+        os.chmod(p, 0o700)
+    except OSError:
+        pass
     return p
 
 
@@ -218,6 +226,10 @@ _TAGLINE_RE = re.compile(r"<[^>]{1,80}>")
 def _clean_title(text):
     if not text:
         return None
+    # Defense in depth: drop C0/C1 control bytes (ESC, BEL, …) so terminal
+    # escape sequences from transcript content or LLM output can never ride
+    # a title, regardless of downstream normalization.
+    text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", " ", text)
     m = re.search(r"<command-args>(.*?)</command-args>", text, re.S)
     if m and m.group(1).strip():
         text = m.group(1)
@@ -364,6 +376,10 @@ def resolve_transcript(agent_rec):
         return None
     if kind == "path":
         return value if os.path.exists(value) else None
+    # A session *id* gets interpolated into paths/globs below — reject
+    # anything that could traverse or glob outside the intended directories.
+    if re.search(r"[/\\*?\[\]]|\.\.", value):
+        return None
     if kind == "id":
         agent = agent_rec.get("agent")
         if agent == "claude":
@@ -1011,7 +1027,16 @@ class InboxDaemon:
 
 
 def main():
+    # Everything this daemon writes derives from the user's private prompts;
+    # nothing it creates should be group/world-readable.
+    os.umask(0o077)
     d = InboxDaemon()
+    for name in ("state.json", "history.jsonl", "daemon.log", "daemon.log.1",
+                 "daemon.lock", "tui_prefs.json"):
+        try:
+            os.chmod(os.path.join(d.dir, name), 0o600)
+        except OSError:
+            pass
     lock_path = os.path.join(d.dir, "daemon.lock")
     # "a" so a losing candidate doesn't truncate the winner's recorded pid.
     lock_file = open(lock_path, "a")

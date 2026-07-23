@@ -128,8 +128,10 @@ def _write_sidebar_bounds(width, mn, mx):
         text = text[: m.start(2)] + str(values[key]) + text[m.end(2):]
 
     tmp = path + ".agent-inbox.tmp"
+    mode = os.stat(path).st_mode & 0o7777
     with open(tmp, "w") as f:
         f.write(text)
+    os.chmod(tmp, mode)  # preserve the user's own config.toml permissions
     os.replace(tmp, path)
 
     herdr = os.environ.get("HERDR_BIN_PATH", "herdr")

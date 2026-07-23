@@ -868,6 +868,7 @@ def run(stdscr):
 
 
 def main():
+    os.umask(0o077)  # prefs/crash-log live in the private plugin state dir
     try:
         curses.wrapper(run)
     except KeyboardInterrupt:
