@@ -94,6 +94,9 @@ def load_agents():
         tokens = rec.get("tokens") or {}
         rows.append({
             "pane_id": rec.get("pane_id"),
+            "tab_id": rec.get("tab_id"),
+            "terminal_id": rec.get("terminal_id"),
+            "cwd": rec.get("cwd") or "",
             "workspace_id": rec.get("workspace_id"),
             "workspace": ws_labels.get(rec.get("workspace_id"), rec.get("workspace_id")),
             "agent": rec.get("agent") or "?",
@@ -110,7 +113,111 @@ def load_agents():
     return rows
 
 
-VIEW_MODES = ("compact", "grouped", "flat")
+_TAB_CACHE = {"ts": 0.0, "labels": {}}
+
+
+def tab_labels(workspace_ids):
+    now = time.time()
+    if now - _TAB_CACHE["ts"] > 15:
+        labels = {}
+        for ws in workspace_ids:
+            try:
+                for t in herdr_request("tab.list", {"workspace_id": ws}).get("tabs", []):
+                    labels[t.get("tab_id")] = t.get("label") or str(t.get("number", "?"))
+            except (OSError, RuntimeError, ValueError):
+                pass
+        _TAB_CACHE["ts"] = now
+        _TAB_CACHE["labels"] = labels
+    return _TAB_CACHE["labels"]
+
+
+def load_history():
+    """terminal_id -> list of closed chats, from the daemon's state file."""
+    p = os.path.join(os.path.dirname(herdr_socket_path()),
+                     "agent-inbox-state", "state.json")
+    try:
+        with open(p) as f:
+            terms = json.load(f).get("terminals", {})
+        return {tid: (t.get("history") or []) for tid, t in terms.items()}
+    except (OSError, ValueError):
+        return {}
+
+
+def chat_emoji(r):
+    if r["rank"] == "5":
+        return "🏁"
+    if r["status"] == "blocked":
+        return "🔴"
+    if r["rank"] == "1":
+        return "🟡"
+    if r["status"] == "working":
+        return "🟢"
+    if r["status"] == "idle":
+        return "⚪"
+    return "❔"
+
+
+_EMOJI_ORDER = ["🔴", "🟡", "🟢", "⚪", "🏁", "⚫", "❔"]
+
+
+def _agg(emojis):
+    uniq = set(emojis)
+    return "".join(e for e in _EMOJI_ORDER if e in uniq)
+
+
+def _short_cwd(cwd):
+    home = os.path.expanduser("~")
+    return ("~" + cwd[len(home):]) if cwd.startswith(home) else cwd
+
+
+def build_tree(rows, history):
+    """workspace → tab → pane(cwd) → chats (live + closed) hierarchy."""
+    lines = []
+    ws_order, tabs_by_ws = [], {}
+    for r in rows:
+        if r["workspace_id"] not in tabs_by_ws:
+            tabs_by_ws[r["workspace_id"]] = {}
+            ws_order.append(r["workspace_id"])
+        tabs = tabs_by_ws[r["workspace_id"]]
+        tabs.setdefault(r["tab_id"], {}).setdefault(r["pane_id"], []).append(r)
+    tlabels = tab_labels(ws_order)
+    for ws in ws_order:
+        ws_emojis = []
+        ws_lines = []
+        for tab_id, panes in tabs_by_ws[ws].items():
+            tab_emojis = []
+            tab_lines = []
+            for pane_id, chats in panes.items():
+                closed = []
+                for c in chats:
+                    for h in (history.get(c["terminal_id"]) or []):
+                        closed.append(h)
+                pane_emojis = [chat_emoji(c) for c in chats] + (["⚫"] if closed else [])
+                tab_lines.append(("pane", {"cwd": _short_cwd(chats[0]["cwd"]),
+                                           "flags": _agg(pane_emojis)}))
+                for c in chats:
+                    tab_lines.append(("row", c))
+                for h in closed:
+                    tab_lines.append(("closed", h))
+                tab_emojis.extend(pane_emojis)
+            tab_lines.insert(0, ("tab", {"label": tlabels.get(tab_id, tab_id or "?"),
+                                         "flags": _agg(tab_emojis)}))
+            ws_lines.extend(tab_lines)
+            ws_emojis.extend(tab_emojis)
+        lines.append(("ws", {"workspace": rows_ws_label(rows, ws),
+                             "flags": _agg(ws_emojis)}))
+        lines.extend(ws_lines)
+    return lines
+
+
+def rows_ws_label(rows, ws_id):
+    for r in rows:
+        if r["workspace_id"] == ws_id:
+            return r["workspace"]
+    return ws_id
+
+
+VIEW_MODES = ("tree", "compact", "grouped", "flat")
 
 
 def _group_flag(group):
@@ -202,8 +309,7 @@ def run(stdscr):
     prefs = load_prefs()
     mode = prefs.get("view")
     if mode not in VIEW_MODES:
-        # Migrate the old boolean pref; default to the compact tree.
-        mode = "grouped" if prefs.get("grouped") else "compact"
+        mode = "tree"
     sel = 0
     status_msg = ""
     rows = []
@@ -214,7 +320,10 @@ def run(stdscr):
             err = None
         except (OSError, RuntimeError, ValueError) as e:
             err = str(e)
-        lines = build_lines(rows, mode)
+        if mode == "tree":
+            lines = build_tree(rows, load_history())
+        else:
+            lines = build_lines(rows, mode)
         row_idx = [i for i, (kind, _) in enumerate(lines) if kind == "row"]
         if row_idx:
             sel = max(0, min(sel, len(row_idx) - 1))
@@ -247,6 +356,29 @@ def run(stdscr):
 
         for y, i in enumerate(range(first, min(len(lines), first + visible))):
             kind, item = lines[i]
+            yy = top + y
+            if kind == "ws":
+                x = seg(yy, 1, "📁", curses.color_pair(5)) + 2
+                x = seg(yy, x, item["workspace"],
+                        curses.color_pair(6) | curses.A_BOLD)
+                x = seg(yy, x, " — ", curses.A_DIM)
+                seg(yy, x, item["flags"], 0)
+                continue
+            if kind == "tab":
+                x = seg(yy, 3, item["label"], curses.color_pair(4) | curses.A_BOLD)
+                x = seg(yy, x, " — ", curses.A_DIM)
+                seg(yy, x, item["flags"], 0)
+                continue
+            if kind == "pane":
+                x = seg(yy, 5, item["cwd"], curses.color_pair(5))
+                x = seg(yy, x, " — ", curses.A_DIM)
+                seg(yy, x, item["flags"], 0)
+                continue
+            if kind == "closed":
+                x = seg(yy, 7, "%s: %s" % (item.get("agent", "?"),
+                                           item.get("title", "")), curses.A_DIM)
+                seg(yy, x, " — ⚫", curses.A_DIM)
+                continue
             if kind == "header":
                 yy = top + y
                 x = seg(yy, 1, "📁", curses.color_pair(5)) + 2  # emoji is 2 cols
@@ -271,6 +403,16 @@ def run(stdscr):
             elif r["rank"] == "5":
                 attr = curses.A_DIM
             selected = bool(row_idx and i == row_idx[sel])
+            if mode == "tree":
+                sel_attr = curses.A_REVERSE if selected else 0
+                if selected:
+                    stdscr.addnstr(yy, 0, " " * (w - 1), w - 1, sel_attr)
+                x = seg(yy, 7, r["agent"], curses.color_pair(4) | sel_attr)
+                x = seg(yy, x, ": ", curses.A_DIM | sel_attr)
+                x = seg(yy, x, r["title"][: max(10, w - x - 8)], attr | sel_attr)
+                x = seg(yy, x, " — ", curses.A_DIM | sel_attr)
+                seg(yy, x, chat_emoji(r), sel_attr)
+                continue
             if mode == "compact":
                 yy = top + y
                 sel_attr = curses.A_REVERSE if selected else 0

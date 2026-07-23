@@ -465,9 +465,24 @@ class InboxDaemon:
                     st["sum_hash"] = None
             self.sum_failed.clear()
 
+    @staticmethod
+    def _archive_chat(st, now):
+        """Append st's current chat to its history (kept, capped at 10)."""
+        hist = list(st.get("history") or [])
+        if st.get("title"):
+            hist.append({"agent": st.get("agent"), "title": st["title"],
+                         "closed": now})
+        return hist[-10:]
+
     def _ensure_title(self, rec, st, now):
         """Generate/refresh the session title for one agent record."""
         sess = rec.get("agent_session") or {}
+        sess_ref = "%s:%s" % (sess.get("kind"), sess.get("value"))
+        if sess.get("value") and st.get("sess_ref") not in (None, sess_ref):
+            # The pane started a NEW native session — archive the old chat.
+            st["history"] = self._archive_chat(st, now)
+        if sess.get("value"):
+            st["sess_ref"] = sess_ref
         sess_key = "%s:%s:%s" % (sess.get("kind"), sess.get("value"),
                                  self.cfg["title_source"])
         fresh = st.get("title_sess") == sess_key
@@ -566,6 +581,7 @@ class InboxDaemon:
                 self.pane_to_tid[pane_id] = tid
                 st = self.terminals.get(tid)
                 if st is None or st.get("agent") != rec.get("agent"):
+                    old = st
                     st = {
                         "agent": rec.get("agent"),
                         "first_seen": now,
@@ -578,6 +594,8 @@ class InboxDaemon:
                         "title_sess": None,
                         "title_tried": 0,
                     }
+                    if old:
+                        st["history"] = self._archive_chat(old, now)
                     self.terminals[tid] = st
                 status = rec.get("agent_status") or "unknown"
                 if status != st.get("last_status"):
