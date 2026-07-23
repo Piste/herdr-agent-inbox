@@ -229,6 +229,56 @@ def do_resume(entry):
     return None
 
 
+# herdr's sidebar renders its selected row with the theme's `surface0`
+# background (see src/app/state.rs + ui/sidebar.rs). Same values here.
+_THEME_SURFACE0 = {
+    "catppuccin": (49, 50, 68), "catppuccin-latte": (204, 208, 218),
+    "tokyo-night": (36, 40, 59), "tokyo-night-day": (196, 200, 218),
+    "dracula": (68, 71, 90), "nord": (59, 66, 82),
+    "gruvbox": (60, 56, 54), "gruvbox-light": (235, 219, 178),
+    "one-dark": (44, 49, 58), "one-light": (240, 240, 241),
+    "solarized": (7, 54, 66), "solarized-light": (238, 232, 213),
+    "kanagawa": (42, 42, 55), "kanagawa-lotus": (220, 213, 172),
+    "rose-pine": (31, 29, 46), "rose-pine-dawn": (242, 233, 225),
+    "vesper": (35, 35, 35),
+}
+
+
+def theme_selection_bg():
+    """The active theme's surface0 RGB, honoring a [theme.custom] override."""
+    path = os.environ.get("HERDR_CONFIG_PATH") or os.path.expanduser(
+        "~/.config/herdr/config.toml")
+    name, custom = None, None
+    try:
+        import tomllib
+        with open(path, "rb") as f:
+            theme = tomllib.load(f).get("theme") or {}
+        name = theme.get("name")
+        custom = (theme.get("custom") or {}).get("surface0")
+    except (OSError, ValueError, ImportError):
+        pass
+    if isinstance(custom, str) and custom.startswith("#") and len(custom) == 7:
+        try:
+            return tuple(int(custom[i:i + 2], 16) for i in (1, 3, 5))
+        except ValueError:
+            pass
+    return _THEME_SURFACE0.get(name or "catppuccin")
+
+
+def _rgb_to_256(r, g, b):
+    """Nearest xterm-256 index (6x6x6 cube vs grayscale ramp)."""
+    def cube(v):
+        return 0 if v < 48 else 1 if v < 115 else (v - 35) // 40
+    qr, qg, qb = cube(r), cube(g), cube(b)
+    steps = [0, 95, 135, 175, 215, 255]
+    cube_idx = 16 + 36 * qr + 6 * qg + qb
+    cube_dist = (steps[qr] - r) ** 2 + (steps[qg] - g) ** 2 + (steps[qb] - b) ** 2
+    gray = max(0, min(23, (sum((r, g, b)) // 3 - 8) // 10))
+    gv = 8 + gray * 10
+    gray_dist = (gv - r) ** 2 + (gv - g) ** 2 + (gv - b) ** 2
+    return (232 + gray) if gray_dist < cube_dist else cube_idx
+
+
 def chat_emoji(r):
     if r["rank"] == "5":
         return "🏁"
@@ -393,6 +443,15 @@ def run(stdscr):
     curses.init_pair(4, curses.COLOR_CYAN, -1)     # agent names / accents
     curses.init_pair(5, curses.COLOR_BLUE, -1)     # folder icon
     curses.init_pair(6, curses.COLOR_MAGENTA, -1)  # workspace names
+    # Selected row: theme surface0 background, like herdr's own sidebar.
+    sel_pair = curses.A_REVERSE
+    bg = theme_selection_bg()
+    if bg and curses.COLORS >= 256:
+        try:
+            curses.init_pair(10, -1, _rgb_to_256(*bg))
+            sel_pair = curses.color_pair(10)
+        except curses.error:
+            pass
     curses.mousemask(curses.ALL_MOUSE_EVENTS)
     stdscr.timeout(2000)  # refresh every 2s when idle
 
@@ -451,6 +510,13 @@ def run(stdscr):
                 stdscr.addnstr(yy, x, s, w - 1 - x, attr)
             return x + len(s)
 
+        def pick(base, on):
+            # Selected rows use the theme highlight pair; curses pairs can't
+            # be OR-combined, so keep only bold/dim from the base attr.
+            if not on:
+                return base
+            return sel_pair | (base & (curses.A_BOLD | curses.A_DIM))
+
         for y, i in enumerate(range(first, min(len(lines), first + visible))):
             kind, item = lines[i]
             yy = top + y
@@ -464,18 +530,18 @@ def run(stdscr):
                 seg(yy, item.get("x", 5), item["cwd"], curses.color_pair(5))
                 continue
             if kind == "hist":
-                sel_attr = curses.A_REVERSE if (row_idx and i == row_idx[sel]) else 0
-                if sel_attr:
-                    stdscr.addnstr(yy, 0, " " * (w - 1), w - 1, sel_attr)
+                on = bool(row_idx and i == row_idx[sel])
+                if on:
+                    stdscr.addnstr(yy, 0, " " * (w - 1), w - 1, sel_pair)
                 when = time.strftime("%d/%m %H:%M", time.localtime(item.get("closed", 0)))
-                x = seg(yy, 1, when, curses.A_DIM | sel_attr)
+                x = seg(yy, 1, when, pick(curses.A_DIM, on))
                 x = seg(yy, x, "  %s" % item.get("agent", "?"),
-                        curses.color_pair(4) | sel_attr)
-                x = seg(yy, x, ": ", curses.A_DIM | sel_attr)
-                x = seg(yy, x, item.get("title", ""), sel_attr)
+                        pick(curses.color_pair(4), on))
+                x = seg(yy, x, ": ", pick(curses.A_DIM, on))
+                x = seg(yy, x, item.get("title", ""), pick(0, on))
                 meta = "  %s%s" % (item.get("workspace") or item.get("workspace_id") or "",
                                    "  ↩" if resume_cmd(item) else "")
-                seg(yy, x, meta, curses.A_DIM | sel_attr)
+                seg(yy, x, meta, pick(curses.A_DIM, on))
                 continue
             if kind == "closed":
                 x = seg(yy, item.get("x", 7), "%s: %s" % (item.get("agent", "?"),
@@ -507,32 +573,30 @@ def run(stdscr):
                 attr = curses.A_DIM
             selected = bool(row_idx and i == row_idx[sel])
             if mode == "tree":
-                sel_attr = curses.A_REVERSE if selected else 0
                 if selected:
-                    stdscr.addnstr(yy, 0, " " * (w - 1), w - 1, sel_attr)
-                x = seg(yy, r.get("_x", 7), r["agent"], curses.color_pair(4) | sel_attr)
-                x = seg(yy, x, ": ", curses.A_DIM | sel_attr)
-                x = seg(yy, x, r["title"][: max(10, w - x - 8)], attr | sel_attr)
-                x = seg(yy, x, " — ", curses.A_DIM | sel_attr)
-                seg(yy, x, chat_emoji(r), sel_attr)
+                    stdscr.addnstr(yy, 0, " " * (w - 1), w - 1, sel_pair)
+                x = seg(yy, r.get("_x", 7), r["agent"],
+                        pick(curses.color_pair(4), selected))
+                x = seg(yy, x, ": ", pick(curses.A_DIM, selected))
+                x = seg(yy, x, r["title"][: max(10, w - x - 8)], pick(attr, selected))
+                x = seg(yy, x, " — ", pick(curses.A_DIM, selected))
+                seg(yy, x, chat_emoji(r), pick(0, selected))
                 continue
             if mode == "compact":
                 yy = top + y
-                sel_attr = curses.A_REVERSE if selected else 0
                 if selected:
-                    stdscr.addnstr(yy, 0, " " * (w - 1), w - 1, sel_attr)
+                    stdscr.addnstr(yy, 0, " " * (w - 1), w - 1, sel_pair)
                 title = r["title"][: max(10, w - len(r["agent"]) - 12)]
-                x = seg(yy, 4, title, attr | sel_attr)
-                x = seg(yy, x, " — ", curses.A_DIM | sel_attr)
-                seg(yy, x, r["agent"], curses.color_pair(4) | sel_attr)
+                x = seg(yy, 4, title, pick(attr, selected))
+                x = seg(yy, x, " — ", pick(curses.A_DIM, selected))
+                seg(yy, x, r["agent"], pick(curses.color_pair(4), selected))
                 continue
             meta = ("%s · %s" % (r["agent"], r["age"]) if mode == "grouped"
                     else "%s · %s · %s" % (r["agent"], r["workspace"], r["age"]))
             indent = "   " if mode == "grouped" else " "
             avail = max(10, w - len(meta) - len(indent) - 7)
             text = "%s%s %-*s  %s" % (indent, icon, avail, r["title"][:avail], meta)
-            if selected:
-                attr |= curses.A_REVERSE
+            attr = pick(attr, selected)
             stdscr.addnstr(top + y, 0, text.ljust(w - 1), w - 1, attr)
         stdscr.refresh()
         status_msg = ""
