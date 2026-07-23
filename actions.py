@@ -25,6 +25,10 @@ import time
 
 SIDEBAR_FLOOR = 10
 SIDEBAR_CEIL = 80
+# Bounds left in config after a keyboard resize, so herdr's NATIVE mouse drag
+# (grab the sidebar's last column) keeps a useful range to move within.
+DRAG_MIN = 20
+DRAG_MAX = 60
 
 
 def state_dir():
@@ -75,44 +79,53 @@ def config_path():
     return os.path.realpath(p)
 
 
-def sidebar_resize(spec):
-    """spec: '+2', '-2', or an absolute column count like '30'.
+def _live_sidebar_width():
+    """Best-known current width. session.json holds the live value (mouse
+    drags land there) but herdr saves it lazily; our own config writes are
+    instant. Trust whichever file is fresher."""
+    sess = os.path.join(
+        os.path.dirname(os.environ.get("HERDR_SOCKET_PATH")
+                        or os.path.expanduser("~/.config/herdr/herdr.sock")),
+        "session.json",
+    )
+    sess_w = cfg_w = None
+    try:
+        with open(sess) as f:
+            w = json.load(f).get("sidebar_width")
+        sess_w = int(w) if w else None
+    except (OSError, ValueError, TypeError):
+        pass
+    try:
+        with open(config_path()) as f:
+            m = re.search(r"(?m)^\s*sidebar_width\s*=\s*(\d+)", f.read())
+        cfg_w = int(m.group(1)) if m else None
+    except OSError:
+        pass
+    if sess_w is not None and cfg_w is not None:
+        try:
+            newer_sess = os.path.getmtime(sess) > os.path.getmtime(config_path())
+        except OSError:
+            newer_sess = True
+        return sess_w if newer_sess else cfg_w
+    return sess_w if sess_w is not None else cfg_w
 
-    Herdr computes the effective sidebar width as
-    clamp(auto_scale_from_content, sidebar_min_width, sidebar_max_width);
-    `sidebar_width` is only a launch-time default and changing it alone does
-    nothing to a live client (verified on 0.7.5). The clamps DO re-apply on
-    reload-config, so resizing pins min = max = target for an exact width.
-    Restore auto-scaling by hand-editing min/max apart again.
-    """
+
+def _write_sidebar_bounds(width, mn, mx):
     path = config_path()
     with open(path, "r") as f:
         text = f.read()
 
-    def get(key):
+    matches = {}
+    for key in ("sidebar_width", "sidebar_min_width", "sidebar_max_width"):
         m = re.search(r"(?m)^(\s*%s\s*=\s*)(\d+)" % key, text)
-        return m, (int(m.group(2)) if m else None)
-
-    m_w, width = get("sidebar_width")
-    m_min, cur_min = get("sidebar_min_width")
-    m_max, cur_max = get("sidebar_max_width")
-    if not (m_w and m_min and m_max):
-        return None, "sidebar_width/min/max not all present in %s" % path
-
-    # Once pinned, min == max == current width; before that, sidebar_width
-    # is the best nominal baseline we have.
-    base = cur_min if cur_min == cur_max else width
-    if spec.startswith(("+", "-")):
-        new = base + int(spec)
-    else:
-        new = int(spec)
-    new = max(SIDEBAR_FLOOR, min(SIDEBAR_CEIL, new))
-    if new == base == cur_min == cur_max:
-        return base, None
-
+        if not m:
+            return "missing %s in %s" % (key, path)
+        matches[key] = m
+    values = {"sidebar_width": width, "sidebar_min_width": mn,
+              "sidebar_max_width": mx}
     # Replace right-to-left so earlier match offsets stay valid.
-    for m in sorted((m_w, m_min, m_max), key=lambda m: -m.start(2)):
-        text = text[: m.start(2)] + str(new) + text[m.end(2):]
+    for key, m in sorted(matches.items(), key=lambda kv: -kv[1].start(2)):
+        text = text[: m.start(2)] + str(values[key]) + text[m.end(2):]
 
     tmp = path + ".agent-inbox.tmp"
     with open(tmp, "w") as f:
@@ -126,7 +139,33 @@ def sidebar_resize(spec):
         diags = json.loads(r.stdout)["result"].get("diagnostics") or []
     except (ValueError, KeyError):
         diags = ["reload-config failed: %s" % (r.stderr or r.stdout)]
-    return new, ("; ".join(diags) if diags else None)
+    return "; ".join(diags) if diags else None
+
+
+def sidebar_resize(spec):
+    """spec: '+2', '-2', or an absolute column count like '30'.
+
+    Herdr resize semantics (verified on 0.7.5): the live width persists in
+    session state and follows config only when config-owned, BUT the min/max
+    clamps re-apply to it on every reload-config. So: phase 1 pins
+    width=min=max=target (forcing the live width), phase 2 relaxes the
+    bounds back to [DRAG_MIN, DRAG_MAX] so herdr's native mouse drag on the
+    sidebar divider (its last column) keeps room to move.
+    """
+    base = _live_sidebar_width()
+    if base is None:
+        base = 34
+    if spec.startswith(("+", "-")):
+        new = base + int(spec)
+    else:
+        new = int(spec)
+    new = max(SIDEBAR_FLOOR, min(SIDEBAR_CEIL, new))
+
+    err = _write_sidebar_bounds(new, new, new)          # force the live width
+    if err:
+        return None, err
+    err = _write_sidebar_bounds(new, min(DRAG_MIN, new), max(DRAG_MAX, new))
+    return new, err
 
 
 def main():

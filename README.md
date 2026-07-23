@@ -137,23 +137,27 @@ command = "herdr plugin pane open --plugin herdr-agent-inbox --entrypoint inbox"
 The `description` fields make the bindings show up properly in the `prefix+?`
 help panel. Then `herdr server reload-config`.
 
-### Sidebar resize (runtime)
+### Sidebar resize (mouse + keyboard)
 
-Herdr has no native runtime sidebar resize, so the plugin provides one: the
-`sidebar-grow` / `sidebar-shrink` actions (bind to e.g. `prefix+alt+right` /
-`prefix+alt+left`) rewrite the sidebar width in `config.toml` and run
-`herdr server reload-config`. Symlinked configs are edited through
-`os.path.realpath`, so a dotfiles symlink survives.
+**Mouse (native herdr, undocumented):** drag the sidebar's **last column**
+(the divider between sidebar and panes) with the left button. Herdr clamps
+the drag to `[sidebar_min_width, sidebar_max_width]` and persists the result
+in session state — so keep those bounds apart (e.g. 20/60). There's also a
+draggable divider between the spaces and agents sections.
 
-How it actually works (verified on herdr 0.7.5): the effective width is
-`clamp(auto_scale_from_content, sidebar_min_width, sidebar_max_width)` —
-`sidebar_width` itself is only a launch-time default and changing it alone
-does nothing to a live client, but the min/max clamps re-apply on reload.
-So resizing **pins `sidebar_width = min = max = target`** for an exact,
-immediate width. Trade-off: auto-scaling is disabled while pinned; restore
-it by hand-editing min/max apart again.
+**Keyboard (plugin):** `sidebar-grow` / `sidebar-shrink` actions (bind to
+e.g. `prefix+alt+right` / `prefix+alt+left`), or an absolute width via
+`python3 actions.py sidebar 36`.
 
-An absolute width also works: `python3 actions.py sidebar 36`.
+How the keyboard path works (verified on herdr 0.7.5): the live width is
+session state — config `sidebar_width` only applies when still config-owned —
+but the min/max clamps re-apply to it on every `reload-config`. So a resize
+runs two phases: pin `width = min = max = target` + reload (forces the live
+width), then relax the bounds back to `[20, 60]` + reload (restores mouse
+drag range). The baseline for `±2` is read from `session.json` (live value,
+where drags land) or the config file, whichever is fresher. Symlinked
+configs are edited through `os.path.realpath`, so a dotfiles symlink
+survives.
 
 ## Notes / limitations
 
