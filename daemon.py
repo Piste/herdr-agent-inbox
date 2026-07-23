@@ -608,6 +608,11 @@ class InboxDaemon:
                 )
                 s.settimeout(2.0)
                 backoff = 1.0
+                # A reconnect can mean the server restarted and lost all
+                # reported metadata — forget what we think we've reported.
+                with self.lock:
+                    self.last_report.clear()
+                    self.ws_report.clear()
                 self.assert_view()   # re-assert after every (re)connect
                 self.dirty.set()
                 buf = b""
