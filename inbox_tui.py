@@ -110,10 +110,26 @@ def load_agents():
     return rows
 
 
-def build_lines(rows, grouped):
+VIEW_MODES = ("compact", "grouped", "flat")
+
+
+def _group_flag(group):
+    """Dominant state of a workspace's agents, most urgent wins."""
+    if any(r["status"] == "blocked" for r in group):
+        return "!"
+    if any(r["rank"] == "1" for r in group):
+        return "●"
+    if any(r["status"] == "working" for r in group):
+        return "▸"
+    if all(r["rank"] == "5" for r in group):
+        return "⚑"
+    return "○"
+
+
+def build_lines(rows, mode):
     """Returns a list of ('header', text) / ('row', row-dict) entries."""
     lines = []
-    if not grouped:
+    if mode == "flat":
         for r in rows:
             lines.append(("row", r))
         return lines
@@ -126,7 +142,11 @@ def build_lines(rows, grouped):
         by_ws[r["workspace_id"]].append(r)
     for ws in order:
         group = by_ws[ws]
-        lines.append(("header", "▾ %s" % group[0]["workspace"]))
+        if mode == "compact":
+            lines.append(("header", "▾ %s — %s" % (group[0]["workspace"],
+                                                   _group_flag(group))))
+        else:
+            lines.append(("header", "▾ %s" % group[0]["workspace"]))
         for r in group:
             lines.append(("row", r))
     return lines
@@ -178,7 +198,10 @@ def run(stdscr):
     stdscr.timeout(2000)  # refresh every 2s when idle
 
     prefs = load_prefs()
-    grouped = bool(prefs.get("grouped", True))  # Codex-style tree by default
+    mode = prefs.get("view")
+    if mode not in VIEW_MODES:
+        # Migrate the old boolean pref; default to the compact tree.
+        mode = "grouped" if prefs.get("grouped") else "compact"
     sel = 0
     status_msg = ""
     rows = []
@@ -189,7 +212,7 @@ def run(stdscr):
             err = None
         except (OSError, RuntimeError, ValueError) as e:
             err = str(e)
-        lines = build_lines(rows, grouped)
+        lines = build_lines(rows, mode)
         row_idx = [i for i, (kind, _) in enumerate(lines) if kind == "row"]
         if row_idx:
             sel = max(0, min(sel, len(row_idx) - 1))
@@ -199,7 +222,7 @@ def run(stdscr):
         header = " Agent Inbox — %s" % counts_line(rows)
         stdscr.addnstr(0, 0, header.ljust(w - 1), w - 1, curses.A_BOLD)
         help_line = (" enter:focus  s:settle  u:unread  c:clear  S:settle-finished"
-                     "  r:retitle  g:group  q:quit  |  right-click: settle/unsettle")
+                     "  r:retitle  g:view  q:quit  |  right-click: settle/unsettle")
         stdscr.addnstr(h - 1, 0, (status_msg or help_line).ljust(w - 1), w - 1, curses.A_DIM)
 
         top = 1
@@ -225,11 +248,15 @@ def run(stdscr):
                 attr = curses.color_pair(3)
             elif r["rank"] == "5":
                 attr = curses.A_DIM
-            meta = ("%s · %s" % (r["agent"], r["age"]) if grouped
-                    else "%s · %s · %s" % (r["agent"], r["workspace"], r["age"]))
-            indent = "   " if grouped else " "
-            avail = max(10, w - len(meta) - len(indent) - 7)
-            text = "%s%s %-*s  %s" % (indent, icon, avail, r["title"][:avail], meta)
+            if mode == "compact":
+                text = "   %s — %s" % (r["title"][: max(10, w - len(r["agent"]) - 10)],
+                                       r["agent"])
+            else:
+                meta = ("%s · %s" % (r["agent"], r["age"]) if mode == "grouped"
+                        else "%s · %s · %s" % (r["agent"], r["workspace"], r["age"]))
+                indent = "   " if mode == "grouped" else " "
+                avail = max(10, w - len(meta) - len(indent) - 7)
+                text = "%s%s %-*s  %s" % (indent, icon, avail, r["title"][:avail], meta)
             if row_idx and i == row_idx[sel]:
                 attr |= curses.A_REVERSE
             stdscr.addnstr(top + y, 0, text.ljust(w - 1), w - 1, attr)
@@ -287,9 +314,10 @@ def run(stdscr):
         elif ch in (ord("k"), curses.KEY_UP):
             sel = max(sel - 1, 0)
         elif ch == ord("g"):
-            grouped = not grouped
-            prefs["grouped"] = grouped
+            mode = VIEW_MODES[(VIEW_MODES.index(mode) + 1) % len(VIEW_MODES)]
+            prefs["view"] = mode
             save_prefs(prefs)
+            status_msg = " view: %s" % mode
         elif ch == 10:  # enter
             try:
                 herdr_request("agent.focus", {"target": cur["pane_id"]})
