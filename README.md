@@ -47,8 +47,37 @@ Treat herdr's Agents sidebar as an **inbox** — inspired by
 - `actions.py` — keybindable plugin actions (settle, unread, settle-workspace,
   retitle, restart-daemon).
 - `inbox_tui.py` — popup inbox (`[[panes]] id="inbox"`, placement popup):
-  j/k navigate, enter focus, `s` settle, `u` unread, `S` settle all finished,
-  `r` retitle, `g` group by workspace, `q` quit.
+  j/k navigate, enter focus, `s` settle, `u` unread, `c` clear flag,
+  `S` settle all finished, `r` retitle, `g` group by workspace, `q` quit.
+  Mouse: left-click selects, double-click focuses, **right-click toggles
+  settle/unsettle** on the row under the cursor. (Herdr's native right-click
+  context menus are hardcoded in the client — `ContextMenuKind` in
+  `src/app/state.rs` — so a plugin cannot add "Settle" there; in-popup mouse
+  is the extension-route answer. Native menu items would need a herdr fork.)
+
+## Title configuration
+
+`<herdr config dir>/plugins/config/herdr-agent-inbox/config.toml`
+(auto-created with comments on first run, hot-reloaded on change):
+
+```toml
+[title]
+source = "first"   # "first" opening prompt | "last" most recent prompt
+summarize = true   # pipe the prompt through summarize_cmd for a real title
+summarize_cmd = "claude -p --model claude-haiku-4-5-20251001 'Write a 4-8 word title for this coding-agent session request. Output ONLY the title, nothing else.'"
+summarize_timeout_secs = 60
+```
+
+`source = "last"` re-derives the title whenever the agent finishes a turn.
+Summaries run on an async worker, are cached per prompt content (so each
+session is summarized once), and fall back to the truncated raw prompt until
+the summary lands or if the command fails.
+
+## Sidebar rollup legend ($agents)
+
+`!2` blocked · `●1` finished-unseen/unread · `▸3` working · `·2` idle ·
+`⚑1` settled. A workspace whose only content is a single idle agent shows
+nothing (the space's own status icon already conveys it).
 
 ## Install
 
