@@ -326,7 +326,9 @@ def build_tree(rows, history):
     ws_rank = {}
     for r in rows:
         tabs = tabs_by_ws.setdefault(r["workspace_id"], {})
-        tabs.setdefault(r["tab_id"], {}).setdefault(r["pane_id"], []).append(r)
+        # Group by directory, not pane: three panes in the same cwd share
+        # one directory line with their chats listed under it.
+        tabs.setdefault(r["tab_id"], {}).setdefault(r["cwd"], []).append(r)
         ws_rank[r["workspace_id"]] = min(r["ws_order"],
                                          ws_rank.get(r["workspace_id"], 999))
     # Same order as the sidebar's spaces list.
@@ -337,10 +339,10 @@ def build_tree(rows, history):
         ws_lines = []
         multi_tab = len(tabs_by_ws[ws]) > 1
         pane_x = 5 if multi_tab else 3  # dedent when the tab row is hidden
-        for tab_id, panes in tabs_by_ws[ws].items():
+        for tab_id, dirs in tabs_by_ws[ws].items():
             tab_emojis = []
             tab_lines = []
-            for pane_id, chats in panes.items():
+            for cwd, chats in dirs.items():
                 closed = []
                 for c in chats:
                     for h in (history.get(c["terminal_id"]) or []):
