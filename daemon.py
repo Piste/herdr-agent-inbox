@@ -22,13 +22,21 @@ after each response); only events.subscribe holds a long-lived connection.
 
 import fcntl
 import glob
+import hashlib
 import json
 import os
+import queue
 import re
 import socket
+import subprocess
 import sys
 import threading
 import time
+
+try:
+    import tomllib
+except ImportError:  # < 3.11
+    tomllib = None
 
 SOURCE = "herdr-agent-inbox"
 TICK_SECS = 30.0
@@ -67,6 +75,70 @@ def state_dir():
     p = os.path.join(os.path.dirname(herdr_socket_path()), "agent-inbox-state")
     os.makedirs(p, exist_ok=True)
     return p
+
+
+def config_file():
+    d = os.environ.get("HERDR_PLUGIN_CONFIG_DIR") or os.path.join(
+        os.path.dirname(herdr_socket_path()), "plugins", "config", "herdr-agent-inbox"
+    )
+    return os.path.join(d, "config.toml")
+
+
+DEFAULT_CONFIG = {
+    "title_source": "first",       # "first" | "last" user prompt
+    "summarize": False,            # pipe the prompt through summarize_cmd
+    "summarize_cmd": "",           # shell cmd: prompt on stdin -> title on stdout
+    "summarize_timeout_secs": 60,
+}
+
+CONFIG_TEMPLATE = """\
+# herdr-agent-inbox configuration
+
+[title]
+# Which user prompt seeds the session title:
+#   "first" — the opening request, like ChatGPT/Claude chat titles
+#   "last"  — the most recent request; re-derived when the agent finishes a turn
+source = "first"
+
+# Produce a meaningful title by piping the prompt through a command instead of
+# showing the (truncated) raw prompt. The command receives the prompt text on
+# stdin and must print a short title on stdout.
+summarize = false
+summarize_cmd = "claude -p --model claude-haiku-4-5-20251001 'Write a 4-8 word title for this coding-agent session request. Output ONLY the title, nothing else.'"
+summarize_timeout_secs = 60
+"""
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    path = config_file()
+    if not os.path.exists(path):
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(CONFIG_TEMPLATE)
+        except OSError:
+            pass
+        return cfg
+    if tomllib is None:
+        return cfg
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+        title = data.get("title") or {}
+        src = title.get("source")
+        if src in ("first", "last"):
+            cfg["title_source"] = src
+        cfg["summarize"] = bool(title.get("summarize", False))
+        cmd = title.get("summarize_cmd")
+        if isinstance(cmd, str):
+            cfg["summarize_cmd"] = cmd
+        t = title.get("summarize_timeout_secs")
+        if isinstance(t, int) and 5 <= t <= 600:
+            cfg["summarize_timeout_secs"] = t
+    except (OSError, ValueError) as e:
+        sys.stderr.write("config load failed: %s\n" % e)
+    return cfg
 
 
 class Log:
@@ -187,33 +259,78 @@ def _user_texts(obj):
     return []
 
 
-def title_from_transcript(path):
-    """First real user prompt (or claude summary line) from a session transcript."""
+def _scan_lines_for_prompt(lines, want_last):
+    """Returns (clean_title, raw_text). For want_last, feed reversed lines."""
     summary = None
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and obj.get("type") == "summary" and obj.get("summary"):
+            summary = summary or _clean_title(str(obj["summary"]))
+            continue
+        for text in _user_texts(obj):
+            if "<system-reminder>" in text and "</system-reminder>" not in text:
+                continue
+            title = _clean_title(text)
+            if title:
+                raw = _raw_prompt(text)
+                return (title if want_last else (summary or title)), raw
+    return summary, None
+
+
+def _raw_prompt(text):
+    """The prompt as summarizer input: unwrapped but untruncated."""
+    m = re.search(r"<command-args>(.*?)</command-args>", text, re.S)
+    if m and m.group(1).strip():
+        text = m.group(1)
+    text = re.sub(r"<system-reminder>.*?</system-reminder>", " ", text, flags=re.S)
+    text = _WS_RE.sub(" ", text).strip()
+    return text[:4000]
+
+
+def _tail_lines(path, max_bytes=512 * 1024):
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        f.seek(max(0, size - max_bytes))
+        data = f.read()
+    lines = data.split(b"\n")
+    if size > max_bytes and lines:
+        lines = lines[1:]  # drop the partial first line
+    return [ln.decode("utf-8", "replace") for ln in lines]
+
+
+def title_from_transcript(path, source="first"):
+    """(clean_title, raw_prompt) from a session transcript.
+
+    source "first": the opening user prompt (preferring claude summary lines).
+    source "last":  the most recent user prompt (tail-scanned).
+    """
     try:
+        if source == "last":
+            # Transcript lines can be huge (base64 images in tool results), so
+            # widen the tail window until a user prompt shows up.
+            size = os.path.getsize(path)
+            cap = 512 * 1024
+            while True:
+                title, raw = _scan_lines_for_prompt(
+                    reversed(_tail_lines(path, cap)), True)
+                if title or cap >= size:
+                    return title, raw
+                cap *= 4
         with open(path, "r", errors="replace") as f:
+            head = []
             for i, line in enumerate(f):
                 if i > 400:
                     break
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(obj, dict) and obj.get("type") == "summary" and obj.get("summary"):
-                    summary = summary or _clean_title(str(obj["summary"]))
-                    continue
-                for text in _user_texts(obj):
-                    if "<system-reminder>" in text and "</system-reminder>" not in text:
-                        continue
-                    title = _clean_title(text)
-                    if title:
-                        return summary or title
+                head.append(line)
+        return _scan_lines_for_prompt(head, False)
     except OSError:
-        return None
-    return summary
+        return None, None
 
 
 def _munge_claude_cwd(cwd):
@@ -266,6 +383,11 @@ class InboxDaemon:
         self.last_report = {}     # terminal_id -> {"title":..., "tokens": {...}}
         self.ws_report = {}       # workspace_id -> tokens dict last reported
         self.pane_to_tid = {}     # pane_id -> terminal_id (from last refresh)
+        self.cfg = load_config()
+        self.cfg_mtime = self._cfg_mtime()
+        self.sum_q = queue.Queue()
+        self.sum_inflight = set()  # (tid, hash) queued or running
+        self.sum_failed = set()    # hashes that failed this run; don't retry
         self._load()
 
     # -- persistence --
@@ -318,31 +440,110 @@ class InboxDaemon:
         except (OSError, RuntimeError) as e:
             self.log("agent.view.set failed: %s" % e)
 
+    def _cfg_mtime(self):
+        try:
+            return os.path.getmtime(config_file())
+        except OSError:
+            return 0
+
+    def _maybe_reload_config(self):
+        m = self._cfg_mtime()
+        if m == self.cfg_mtime:
+            return
+        self.cfg_mtime = m
+        old = self.cfg
+        self.cfg = load_config()
+        if (old["title_source"], old["summarize"], old["summarize_cmd"]) != (
+            self.cfg["title_source"], self.cfg["summarize"], self.cfg["summarize_cmd"]
+        ):
+            self.log("config changed: source=%s summarize=%s — retitling all"
+                     % (self.cfg["title_source"], self.cfg["summarize"]))
+            with self.lock:
+                for st in self.terminals.values():
+                    st["title"] = None
+                    st["title_tried"] = 0
+                    st["sum_hash"] = None
+            self.sum_failed.clear()
+
     def _ensure_title(self, rec, st, now):
         """Generate/refresh the session title for one agent record."""
         sess = rec.get("agent_session") or {}
-        sess_key = "%s:%s" % (sess.get("kind"), sess.get("value"))
-        if st.get("title") and st.get("title_sess") == sess_key:
+        sess_key = "%s:%s:%s" % (sess.get("kind"), sess.get("value"),
+                                 self.cfg["title_source"])
+        fresh = st.get("title_sess") == sess_key
+        if st.get("title") and fresh and not st.get("title_stale"):
             return
         # Retry transcripts at most once per tick; they appear shortly after
         # the first prompt is sent.
-        if st.get("title_tried", 0) > now - (TICK_SECS - 1) and st.get("title_sess") == sess_key:
+        if st.get("title_tried", 0) > now - (TICK_SECS - 1) and fresh and not st.get("title_stale"):
             return
         st["title_tried"] = now
-        st["title_sess"] = sess_key
-        path = resolve_transcript(rec)
-        if path:
-            title = title_from_transcript(path)
-            if title:
-                if title != st.get("title"):
-                    st["title"] = title
-                    self.log("title %s -> %r" % (rec.get("pane_id"), title))
-                return
-        if not st.get("title"):
+        if not fresh:
+            st["title_sess"] = sess_key
             st["title"] = None
+            st["sum_hash"] = None
+        st["title_stale"] = False
+        path = resolve_transcript(rec)
+        if not path:
+            if not st.get("title"):
+                st["title"] = None
+            return
+        title, raw = title_from_transcript(path, self.cfg["title_source"])
+        if not title:
+            return
+        summarize = bool(self.cfg["summarize"] and self.cfg["summarize_cmd"] and raw)
+        if not summarize:
+            if title != st.get("title"):
+                st["title"] = title
+                self.log("title %s -> %r" % (rec.get("pane_id"), title))
+            return
+        h = hashlib.sha1(raw.encode()).hexdigest()[:12]
+        if st.get("sum_hash") == h and st.get("title"):
+            return  # already summarized this content
+        if not st.get("title"):
+            st["title"] = title  # heuristic placeholder until the summary lands
+        tid = rec.get("terminal_id")
+        if h in self.sum_failed or (tid, h) in self.sum_inflight:
+            return
+        self.sum_inflight.add((tid, h))
+        self.sum_q.put((tid, h, rec.get("agent"), rec.get("cwd"), raw))
+
+    def summarize_loop(self):
+        env = dict(os.environ)
+        env["PATH"] = env.get("PATH", "") + ":/opt/homebrew/bin:/usr/local/bin"
+        while not self.stop.is_set():
+            try:
+                tid, h, agent, cwd, raw = self.sum_q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            payload = "Agent: %s\nWorkdir: %s\n\nRequest:\n%s" % (agent, cwd, raw)
+            title = None
+            try:
+                r = subprocess.run(
+                    self.cfg["summarize_cmd"], shell=True, env=env,
+                    input=payload, capture_output=True, text=True,
+                    timeout=self.cfg["summarize_timeout_secs"],
+                )
+                if r.returncode == 0:
+                    title = _clean_title(r.stdout.strip().splitlines()[0] if r.stdout.strip() else "")
+                else:
+                    self.log("summarize_cmd rc=%d: %s" % (r.returncode, (r.stderr or "")[:200]))
+            except (OSError, subprocess.TimeoutExpired) as e:
+                self.log("summarize failed: %s" % e)
+            with self.lock:
+                self.sum_inflight.discard((tid, h))
+                st = self.terminals.get(tid)
+                if title and st:
+                    st["title"] = title
+                    st["sum_hash"] = h
+                    self.log("summary %s -> %r" % (tid, title))
+                    self.dirty.set()
+                elif not title:
+                    self.sum_failed.add(h)
 
     def refresh(self):
         now = time.time()
+        self._maybe_reload_config()
         try:
             agents = herdr_request("agent.list", {}).get("agents", [])
         except (OSError, RuntimeError, ValueError) as e:
@@ -382,6 +583,10 @@ class InboxDaemon:
                         # New activity reopens the item, Theo-style.
                         st["settled"] = False
                         st["unread"] = False
+                    elif self.cfg["title_source"] == "last":
+                        # Turn ended — the latest prompt may have changed.
+                        st["title_stale"] = True
+                        st["title_tried"] = 0
                 st["gone_since"] = None
                 self._ensure_title(rec, st, now)
 
@@ -450,8 +655,14 @@ class InboxDaemon:
                 ("idle", "·"),      # ·
                 ("settled", FLAG_SETTLED),
             ):
-                if counts[key]:
-                    pieces.append("%s%d" % (sym, counts[key]))
+                if not counts[key]:
+                    continue
+                # A lone idle agent is the workspace's default state — the
+                # space's own status icon already says it; skip the noise.
+                if key == "idle" and counts[key] == 1 and not pieces \
+                        and not counts["settled"]:
+                    continue
+                pieces.append("%s%d" % (sym, counts[key]))
             tokens = {
                 "agents": " ".join(pieces),
                 "busy": ("▸%s" % fmt_dur(busiest)) if busiest else "",
@@ -534,6 +745,7 @@ class InboxDaemon:
                     return {"ok": False, "error": "no agent in pane %s" % cmd.get("pane_id")}
                 st["title"] = None
                 st["title_tried"] = 0
+                st["sum_hash"] = None
                 title = ""
             elif op == "ping":
                 return {"ok": True, "pong": True}
@@ -651,9 +863,11 @@ class InboxDaemon:
             self.dirty.set()
 
     def run(self):
-        self.log("daemon starting (pid %d)" % os.getpid())
+        self.log("daemon starting (pid %d, title_source=%s, summarize=%s)"
+                 % (os.getpid(), self.cfg["title_source"], self.cfg["summarize"]))
         threading.Thread(target=self.control_loop, daemon=True).start()
         threading.Thread(target=self.events_loop, daemon=True).start()
+        threading.Thread(target=self.summarize_loop, daemon=True).start()
         while not self.stop.is_set():
             fired = self.dirty.wait(TICK_SECS)
             if fired:

@@ -6,10 +6,15 @@ An inbox over all agent panes: attention first, settled at the bottom.
 Keys:
   j/k, arrows   move          enter  focus agent (closes popup)
   s             settle        u      mark unread
+  c             clear settle/unread flag
   S             settle every finished (done/idle) agent
   r             regenerate title
   g             toggle group-by-workspace
   q / esc       quit
+
+Mouse:
+  left click    select        double left click   focus agent
+  right click   toggle settle/unsettle on the row under the cursor
 """
 
 import curses
@@ -148,6 +153,7 @@ def run(stdscr):
     curses.init_pair(2, curses.COLOR_YELLOW, -1)   # done / unread
     curses.init_pair(3, curses.COLOR_GREEN, -1)    # working
     curses.init_pair(4, curses.COLOR_CYAN, -1)     # headers
+    curses.mousemask(curses.ALL_MOUSE_EVENTS)
     stdscr.timeout(2000)  # refresh every 2s when idle
 
     grouped = False
@@ -170,7 +176,8 @@ def run(stdscr):
         stdscr.erase()
         header = " Agent Inbox — %s" % counts_line(rows)
         stdscr.addnstr(0, 0, header.ljust(w - 1), w - 1, curses.A_BOLD)
-        help_line = " enter:focus  s:settle  u:unread  S:settle-finished  r:retitle  g:group  q:quit"
+        help_line = (" enter:focus  s:settle  u:unread  c:clear  S:settle-finished"
+                     "  r:retitle  g:group  q:quit  |  right-click: settle/unsettle")
         stdscr.addnstr(h - 1, 0, (status_msg or help_line).ljust(w - 1), w - 1, curses.A_DIM)
 
         top = 1
@@ -204,11 +211,49 @@ def run(stdscr):
         stdscr.refresh()
         status_msg = ""
 
+        def send_op(op, row):
+            try:
+                resp = control_send({"cmd": op, "pane_id": row["pane_id"]})
+                if not resp.get("ok"):
+                    return " %s failed: %s" % (op, resp.get("error"))
+                time.sleep(0.6)  # let the daemon re-report before refresh
+                return ""
+            except (OSError, ValueError) as e:
+                return " daemon not reachable: %s" % e
+
         ch = stdscr.getch()
         if ch in (ord("q"), 27):
             return
         if ch == -1:
             continue  # timeout -> refresh
+        if ch == curses.KEY_MOUSE:
+            try:
+                _, mx, my, _, bstate = curses.getmouse()
+            except curses.error:
+                continue
+            i = first + (my - top)
+            if not (0 <= my - top < visible and 0 <= i < len(lines)):
+                continue
+            if lines[i][0] != "row":
+                continue
+            row = lines[i][1]
+            if i in row_idx:
+                sel = row_idx.index(i)
+            if bstate & (curses.BUTTON3_CLICKED | curses.BUTTON3_PRESSED
+                         | curses.BUTTON3_RELEASED):
+                # Right-click: toggle settled/unsettled on the row under cursor.
+                op = "clear" if (row["rank"] == "5" or row["flag"]) else "settle"
+                status_msg = send_op(op, row) or (
+                    " ⚑ settled: %s" % row["title"] if op == "settle"
+                    else " cleared: %s" % row["title"])
+            elif bstate & curses.BUTTON1_DOUBLE_CLICKED:
+                try:
+                    herdr_request("agent.focus", {"target": row["pane_id"]})
+                except (OSError, RuntimeError) as e:
+                    status_msg = " focus failed: %s" % e
+                    continue
+                return
+            continue
         if not row_idx:
             continue
         cur = lines[row_idx[sel]][1]
@@ -225,16 +270,9 @@ def run(stdscr):
                 status_msg = " focus failed: %s" % e
                 continue
             return
-        elif ch in (ord("s"), ord("u"), ord("r")):
-            op = {"s": "settle", "u": "unread", "r": "retitle"}[chr(ch)]
-            try:
-                resp = control_send({"cmd": op, "pane_id": cur["pane_id"]})
-                if not resp.get("ok"):
-                    status_msg = " %s failed: %s" % (op, resp.get("error"))
-                else:
-                    time.sleep(0.6)  # let the daemon re-report before refresh
-            except (OSError, ValueError) as e:
-                status_msg = " daemon not reachable: %s" % e
+        elif ch in (ord("s"), ord("u"), ord("r"), ord("c")):
+            op = {"s": "settle", "u": "unread", "r": "retitle", "c": "clear"}[chr(ch)]
+            status_msg = send_op(op, cur)
         elif ch == ord("S"):
             n = 0
             for r in rows:
