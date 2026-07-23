@@ -465,14 +465,41 @@ class InboxDaemon:
                     st["sum_hash"] = None
             self.sum_failed.clear()
 
-    @staticmethod
-    def _archive_chat(st, now):
-        """Append st's current chat to its history (kept, capped at 10)."""
+    def _archive_chat(self, st, now):
+        """Archive st's current chat: into its in-pane history (capped 10,
+        drives the tree's ⚫ rows) and the durable history.jsonl (drives the
+        ChatGPT-style history browser, resumable via stored session refs)."""
         hist = list(st.get("history") or [])
         if st.get("title"):
-            hist.append({"agent": st.get("agent"), "title": st["title"],
+            entry = {
+                "agent": st.get("agent"),
+                "title": st["title"],
+                "closed": now,
+                "first_seen": st.get("first_seen"),
+                "workspace_id": st.get("ws"),
+                "workspace": st.get("ws_label"),
+                "pane_id": st.get("pane_id"),
+                "cwd": st.get("cwd"),
+                "sess_kind": st.get("sess_kind"),
+                "sess_value": st.get("sess_value"),
+            }
+            hist.append({"agent": entry["agent"], "title": entry["title"],
                          "closed": now})
+            self._append_history(entry)
         return hist[-10:]
+
+    def _append_history(self, entry):
+        path = os.path.join(self.dir, "history.jsonl")
+        try:
+            if os.path.exists(path) and os.path.getsize(path) > 400_000:
+                with open(path) as f:
+                    tail = f.readlines()[-1000:]
+                with open(path, "w") as f:
+                    f.writelines(tail)
+            with open(path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except OSError as e:
+            self.log("history append failed: %s" % e)
 
     def _ensure_title(self, rec, st, now):
         """Generate/refresh the session title for one agent record."""
@@ -483,6 +510,8 @@ class InboxDaemon:
             st["history"] = self._archive_chat(st, now)
         if sess.get("value"):
             st["sess_ref"] = sess_ref
+            st["sess_kind"] = sess.get("kind")
+            st["sess_value"] = sess.get("value")
         sess_key = "%s:%s:%s" % (sess.get("kind"), sess.get("value"),
                                  self.cfg["title_source"])
         fresh = st.get("title_sess") == sess_key
@@ -568,6 +597,12 @@ class InboxDaemon:
         except (OSError, RuntimeError, ValueError) as e:
             self.log("agent.list failed: %s" % e)
             return
+        ws_labels = {}
+        try:
+            for wsr in herdr_request("workspace.list", {}).get("workspaces", []):
+                ws_labels[wsr.get("workspace_id")] = wsr.get("label")
+        except (OSError, RuntimeError, ValueError):
+            pass
         with self.lock:
             self.pane_to_tid = {}
             seen_tids = set()
@@ -610,6 +645,11 @@ class InboxDaemon:
                         st["title_stale"] = True
                         st["title_tried"] = 0
                 st["gone_since"] = None
+                st["gone_archived"] = False
+                st["ws"] = rec.get("workspace_id")
+                st["ws_label"] = ws_labels.get(rec.get("workspace_id"))
+                st["pane_id"] = pane_id
+                st["cwd"] = rec.get("cwd")
                 self._ensure_title(rec, st, now)
 
                 title = (
@@ -719,7 +759,13 @@ class InboxDaemon:
             gone = st.get("gone_since")
             if not gone:
                 st["gone_since"] = now
-            elif now - gone > STATE_KEEP_SECS:
+                continue
+            # Archive the chat once the pane has been gone long enough that
+            # this isn't just a server-restart or detection blip.
+            if now - gone > 120 and not st.get("gone_archived"):
+                st["gone_archived"] = True
+                st["history"] = self._archive_chat(st, now)
+            if now - gone > STATE_KEEP_SECS:
                 del self.terminals[tid]
                 self.last_report.pop(tid, None)
 

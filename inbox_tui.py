@@ -20,7 +20,9 @@ Mouse:
 import curses
 import json
 import os
+import shlex
 import socket
+import subprocess
 import sys
 import time
 
@@ -84,9 +86,11 @@ def control_send(cmd):
 def load_agents():
     agents = herdr_request("agent.list", {}).get("agents", [])
     ws_labels = {}
+    ws_order = {}
     try:
-        for ws in herdr_request("workspace.list", {}).get("workspaces", []):
+        for idx, ws in enumerate(herdr_request("workspace.list", {}).get("workspaces", [])):
             ws_labels[ws.get("workspace_id")] = ws.get("label") or ws.get("workspace_id")
+            ws_order[ws.get("workspace_id")] = idx
     except (OSError, RuntimeError, ValueError):
         pass
     rows = []
@@ -98,6 +102,7 @@ def load_agents():
             "terminal_id": rec.get("terminal_id"),
             "cwd": rec.get("cwd") or "",
             "workspace_id": rec.get("workspace_id"),
+            "ws_order": ws_order.get(rec.get("workspace_id"), 999),
             "workspace": ws_labels.get(rec.get("workspace_id"), rec.get("workspace_id")),
             "agent": rec.get("agent") or "?",
             "status": rec.get("agent_status") or "unknown",
@@ -143,6 +148,87 @@ def load_history():
         return {}
 
 
+def load_hist_entries():
+    """Archived chats from the daemon's history.jsonl, newest first."""
+    p = os.path.join(os.path.dirname(herdr_socket_path()),
+                     "agent-inbox-state", "history.jsonl")
+    entries = []
+    try:
+        with open(p) as f:
+            for ln in f.readlines()[-200:]:
+                try:
+                    entries.append(json.loads(ln))
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    entries.reverse()
+    return entries
+
+
+def resume_cmd(entry):
+    """Command that reopens this chat in its native CLI, or None."""
+    agent = entry.get("agent")
+    kind, val = entry.get("sess_kind"), entry.get("sess_value")
+    if not val:
+        return None
+    if agent == "claude" and kind == "id":
+        return "claude --resume %s" % shlex.quote(val)
+    if agent == "pi":
+        return "pi --session %s" % shlex.quote(val)
+    if agent == "codex" and kind == "id":
+        return "codex resume %s" % shlex.quote(val)
+    return None
+
+
+def _herdr_cli(*args):
+    herdr = os.environ.get("HERDR_BIN_PATH", "herdr")
+    r = subprocess.run([herdr, *args], capture_output=True, text=True)
+    try:
+        return json.loads(r.stdout).get("result") or {}
+    except ValueError:
+        return {}
+
+
+def do_resume(entry):
+    """Reopen an archived chat: split near where it lived (or recreate its
+    workspace) and launch the agent's native resume command. Returns an
+    error string, or None on success."""
+    cmd = resume_cmd(entry)
+    if not cmd:
+        return "no resumable session ref for this chat"
+    new_pane = None
+    target = None
+    pane = entry.get("pane_id")
+    if pane and _herdr_cli("pane", "get", pane).get("pane"):
+        target = pane
+    if not target and entry.get("workspace_id"):
+        panes = _herdr_cli("pane", "list", "--workspace",
+                           entry["workspace_id"]).get("panes") or []
+        if panes:
+            target = panes[0].get("pane_id")
+    if target:
+        args = ["pane", "split", target, "--direction", "down", "--focus"]
+        if entry.get("cwd"):
+            args += ["--cwd", entry["cwd"]]
+        new_pane = (_herdr_cli(*args).get("pane") or {}).get("pane_id")
+    else:
+        args = ["workspace", "create", "--focus"]
+        if entry.get("cwd"):
+            args += ["--cwd", entry["cwd"]]
+        if entry.get("workspace"):
+            args += ["--label", entry["workspace"]]
+        ws = (_herdr_cli(*args).get("workspace") or {}).get("workspace_id")
+        if ws:
+            panes = _herdr_cli("pane", "list", "--workspace", ws).get("panes") or []
+            if panes:
+                new_pane = panes[0].get("pane_id")
+    if not new_pane:
+        return "could not open a pane to resume into"
+    _herdr_cli("pane", "run", new_pane, cmd)
+    return None
+
+
 def chat_emoji(r):
     if r["rank"] == "5":
         return "🏁"
@@ -173,13 +259,15 @@ def _short_cwd(cwd):
 def build_tree(rows, history):
     """workspace → tab → pane(cwd) → chats (live + closed) hierarchy."""
     lines = []
-    ws_order, tabs_by_ws = [], {}
+    tabs_by_ws = {}
+    ws_rank = {}
     for r in rows:
-        if r["workspace_id"] not in tabs_by_ws:
-            tabs_by_ws[r["workspace_id"]] = {}
-            ws_order.append(r["workspace_id"])
-        tabs = tabs_by_ws[r["workspace_id"]]
+        tabs = tabs_by_ws.setdefault(r["workspace_id"], {})
         tabs.setdefault(r["tab_id"], {}).setdefault(r["pane_id"], []).append(r)
+        ws_rank[r["workspace_id"]] = min(r["ws_order"],
+                                         ws_rank.get(r["workspace_id"], 999))
+    # Same order as the sidebar's spaces list.
+    ws_order = sorted(tabs_by_ws, key=lambda w: ws_rank[w])
     tlabels = tab_labels(ws_order)
     for ws in ws_order:
         ws_emojis = []
@@ -245,12 +333,10 @@ def build_lines(rows, mode):
             lines.append(("row", r))
         return lines
     by_ws = {}
-    order = []
     for r in rows:
-        if r["workspace_id"] not in by_ws:
-            by_ws[r["workspace_id"]] = []
-            order.append(r["workspace_id"])
-        by_ws[r["workspace_id"]].append(r)
+        by_ws.setdefault(r["workspace_id"], []).append(r)
+    # Same order as the sidebar's spaces list.
+    order = sorted(by_ws, key=lambda w: by_ws[w][0]["ws_order"])
     for ws in order:
         group = by_ws[ws]
         lines.append(("header", {
@@ -314,6 +400,7 @@ def run(stdscr):
     mode = prefs.get("view")
     if mode not in VIEW_MODES:
         mode = "tree"
+    hist_mode = False
     sel = 0
     status_msg = ""
     rows = []
@@ -324,20 +411,26 @@ def run(stdscr):
             err = None
         except (OSError, RuntimeError, ValueError) as e:
             err = str(e)
-        if mode == "tree":
+        if hist_mode:
+            lines = [("hist", e) for e in load_hist_entries()]
+        elif mode == "tree":
             lines = build_tree(rows, load_history())
         else:
             lines = build_lines(rows, mode)
-        row_idx = [i for i, (kind, _) in enumerate(lines) if kind == "row"]
+        row_idx = [i for i, (kind, _) in enumerate(lines) if kind in ("row", "hist")]
         if row_idx:
             sel = max(0, min(sel, len(row_idx) - 1))
 
         h, w = stdscr.getmaxyx()
         stdscr.erase()
-        header = " Agent Inbox — %s" % counts_line(rows)
+        if hist_mode:
+            header = " Chat history — %d archived (newest first)" % len(lines)
+            help_line = " enter/dbl-click:reopen chat (↩ = resumable)  h:back  q:quit"
+        else:
+            header = " Agent Inbox — %s" % counts_line(rows)
+            help_line = (" enter:focus  s:settle  u:unread  c:clear  S:settle-finished"
+                         "  r:retitle  g:view  h:history  q:quit  |  right-click: settle")
         stdscr.addnstr(0, 0, header.ljust(w - 1), w - 1, curses.A_BOLD)
-        help_line = (" enter:focus  s:settle  u:unread  c:clear  S:settle-finished"
-                     "  r:retitle  g:view  q:quit  |  right-click: settle/unsettle")
         stdscr.addnstr(h - 1, 0, (status_msg or help_line).ljust(w - 1), w - 1, curses.A_DIM)
 
         top = 1
@@ -362,20 +455,27 @@ def run(stdscr):
             kind, item = lines[i]
             yy = top + y
             if kind == "ws":
-                x = seg(yy, 1, item["workspace"],
-                        curses.color_pair(6) | curses.A_BOLD)
-                x = seg(yy, x, " — ", curses.A_DIM)
-                seg(yy, x, item["flags"], 0)
+                seg(yy, 1, item["workspace"], curses.color_pair(6) | curses.A_BOLD)
                 continue
             if kind == "tab":
-                x = seg(yy, 3, item["label"], curses.color_pair(4) | curses.A_BOLD)
-                x = seg(yy, x, " — ", curses.A_DIM)
-                seg(yy, x, item["flags"], 0)
+                seg(yy, 3, item["label"], curses.color_pair(4) | curses.A_BOLD)
                 continue
             if kind == "pane":
-                x = seg(yy, item.get("x", 5), item["cwd"], curses.color_pair(5))
-                x = seg(yy, x, " — ", curses.A_DIM)
-                seg(yy, x, item["flags"], 0)
+                seg(yy, item.get("x", 5), item["cwd"], curses.color_pair(5))
+                continue
+            if kind == "hist":
+                sel_attr = curses.A_REVERSE if (row_idx and i == row_idx[sel]) else 0
+                if sel_attr:
+                    stdscr.addnstr(yy, 0, " " * (w - 1), w - 1, sel_attr)
+                when = time.strftime("%d/%m %H:%M", time.localtime(item.get("closed", 0)))
+                x = seg(yy, 1, when, curses.A_DIM | sel_attr)
+                x = seg(yy, x, "  %s" % item.get("agent", "?"),
+                        curses.color_pair(4) | sel_attr)
+                x = seg(yy, x, ": ", curses.A_DIM | sel_attr)
+                x = seg(yy, x, item.get("title", ""), sel_attr)
+                meta = "  %s%s" % (item.get("workspace") or item.get("workspace_id") or "",
+                                   "  ↩" if resume_cmd(item) else "")
+                seg(yy, x, meta, curses.A_DIM | sel_attr)
                 continue
             if kind == "closed":
                 x = seg(yy, item.get("x", 7), "%s: %s" % (item.get("agent", "?"),
@@ -452,6 +552,10 @@ def run(stdscr):
             return
         if ch == -1:
             continue  # timeout -> refresh
+        if ch == ord("h"):
+            hist_mode = not hist_mode
+            sel = 0
+            continue
         if ch == curses.KEY_MOUSE:
             try:
                 _, mx, my, _, bstate = curses.getmouse()
@@ -460,11 +564,19 @@ def run(stdscr):
             i = first + (my - top)
             if not (0 <= my - top < visible and 0 <= i < len(lines)):
                 continue
-            if lines[i][0] != "row":
+            if lines[i][0] not in ("row", "hist"):
                 continue
             row = lines[i][1]
             if i in row_idx:
                 sel = row_idx.index(i)
+            if lines[i][0] == "hist":
+                if bstate & curses.BUTTON1_DOUBLE_CLICKED:
+                    err = do_resume(row)
+                    if err:
+                        status_msg = " " + err
+                        continue
+                    return
+                continue
             if bstate & (curses.BUTTON3_CLICKED | curses.BUTTON3_PRESSED
                          | curses.BUTTON3_RELEASED):
                 # Right-click: toggle settled/unsettled on the row under cursor.
@@ -482,17 +594,23 @@ def run(stdscr):
             continue
         if not row_idx:
             continue
-        cur = lines[row_idx[sel]][1]
+        cur_kind, cur = lines[row_idx[sel]]
         if ch in (ord("j"), curses.KEY_DOWN):
             sel = min(sel + 1, len(row_idx) - 1)
         elif ch in (ord("k"), curses.KEY_UP):
             sel = max(sel - 1, 0)
-        elif ch == ord("g"):
+        elif ch == ord("g") and not hist_mode:
             mode = VIEW_MODES[(VIEW_MODES.index(mode) + 1) % len(VIEW_MODES)]
             prefs["view"] = mode
             save_prefs(prefs)
             status_msg = " view: %s" % mode
         elif ch == 10:  # enter
+            if cur_kind == "hist":
+                err = do_resume(cur)
+                if err:
+                    status_msg = " " + err
+                    continue
+                return
             try:
                 herdr_request("agent.focus", {"target": cur["pane_id"]})
             except (OSError, RuntimeError) as e:
@@ -500,9 +618,12 @@ def run(stdscr):
                 continue
             return
         elif ch in (ord("s"), ord("u"), ord("r"), ord("c")):
+            if cur_kind == "hist":
+                status_msg = " archived chat — enter reopens it"
+                continue
             op = {"s": "settle", "u": "unread", "r": "retitle", "c": "clear"}[chr(ch)]
             status_msg = send_op(op, cur)
-        elif ch == ord("S"):
+        elif ch == ord("S") and not hist_mode:
             n = 0
             for r in rows:
                 if r["status"] in ("done", "idle") and r["rank"] != "5":
@@ -520,6 +641,13 @@ def main():
         curses.wrapper(run)
     except KeyboardInterrupt:
         pass
+    except Exception:
+        import traceback
+        p = os.path.join(os.path.dirname(herdr_socket_path()),
+                         "agent-inbox-state", "tui-crash.log")
+        with open(p, "a") as f:
+            traceback.print_exc(file=f)
+        raise
     return 0
 
 
