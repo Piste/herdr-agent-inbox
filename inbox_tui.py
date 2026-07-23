@@ -126,10 +126,31 @@ def build_lines(rows, grouped):
         by_ws[r["workspace_id"]].append(r)
     for ws in order:
         group = by_ws[ws]
-        lines.append(("header", "%s  (%d)" % (group[0]["workspace"], len(group))))
+        lines.append(("header", "▾ %s" % group[0]["workspace"]))
         for r in group:
             lines.append(("row", r))
     return lines
+
+
+def _prefs_path():
+    return os.path.join(os.path.dirname(herdr_socket_path()),
+                        "agent-inbox-state", "tui_prefs.json")
+
+
+def load_prefs():
+    try:
+        with open(_prefs_path()) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_prefs(prefs):
+    try:
+        with open(_prefs_path(), "w") as f:
+            json.dump(prefs, f)
+    except OSError:
+        pass
 
 
 def counts_line(rows):
@@ -156,7 +177,8 @@ def run(stdscr):
     curses.mousemask(curses.ALL_MOUSE_EVENTS)
     stdscr.timeout(2000)  # refresh every 2s when idle
 
-    grouped = False
+    prefs = load_prefs()
+    grouped = bool(prefs.get("grouped", True))  # Codex-style tree by default
     sel = 0
     status_msg = ""
     rows = []
@@ -203,8 +225,11 @@ def run(stdscr):
                 attr = curses.color_pair(3)
             elif r["rank"] == "5":
                 attr = curses.A_DIM
-            meta = "%s · %s · %s" % (r["agent"], r["workspace"], r["age"])
-            text = " %s %-*s  %s" % (icon, max(10, w - len(meta) - 8), r["title"][:w - len(meta) - 8], meta)
+            meta = ("%s · %s" % (r["agent"], r["age"]) if grouped
+                    else "%s · %s · %s" % (r["agent"], r["workspace"], r["age"]))
+            indent = "   " if grouped else " "
+            avail = max(10, w - len(meta) - len(indent) - 7)
+            text = "%s%s %-*s  %s" % (indent, icon, avail, r["title"][:avail], meta)
             if row_idx and i == row_idx[sel]:
                 attr |= curses.A_REVERSE
             stdscr.addnstr(top + y, 0, text.ljust(w - 1), w - 1, attr)
@@ -263,6 +288,8 @@ def run(stdscr):
             sel = max(sel - 1, 0)
         elif ch == ord("g"):
             grouped = not grouped
+            prefs["grouped"] = grouped
+            save_prefs(prefs)
         elif ch == 10:  # enter
             try:
                 herdr_request("agent.focus", {"target": cur["pane_id"]})
