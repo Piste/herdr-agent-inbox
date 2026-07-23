@@ -195,6 +195,8 @@ def main():
     workspace_id = ctx.get("workspace_id")
 
     cmd = {"cmd": op, "pane_id": pane_id, "workspace_id": workspace_id}
+    if op == "set-title" and len(sys.argv) > 3:
+        cmd["title"] = sys.argv[3]
     resp = None
     for attempt in (1, 2):
         try:

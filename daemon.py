@@ -471,6 +471,10 @@ class InboxDaemon:
         sess_key = "%s:%s:%s" % (sess.get("kind"), sess.get("value"),
                                  self.cfg["title_source"])
         fresh = st.get("title_sess") == sess_key
+        if st.get("title_manual") and st.get("title"):
+            if fresh:
+                return
+            st["title_manual"] = False  # new session ref supersedes manual title
         if st.get("title") and fresh and not st.get("title_stale"):
             return
         # Retry transcripts at most once per tick; they appear shortly after
@@ -740,6 +744,19 @@ class InboxDaemon:
                         st["unread"] = False
                         n += 1
                 title = "%d agents" % n
+            elif op == "set-title":
+                tid = self.pane_to_tid.get(cmd.get("pane_id"))
+                st = self.terminals.get(tid)
+                if not st:
+                    return {"ok": False, "error": "no agent in pane %s" % cmd.get("pane_id")}
+                title = _clean_title(str(cmd.get("title") or ""))
+                if not title:
+                    return {"ok": False, "error": "empty/unusable title"}
+                # Manual titles stick until the agent's session ref changes
+                # (a new conversation) or an explicit retitle.
+                st["title"] = title
+                st["title_manual"] = True
+                st["sum_hash"] = None
             elif op == "retitle":
                 tid = self.pane_to_tid.get(cmd.get("pane_id"))
                 st = self.terminals.get(tid)
@@ -748,6 +765,7 @@ class InboxDaemon:
                 st["title"] = None
                 st["title_tried"] = 0
                 st["sum_hash"] = None
+                st["title_manual"] = False
                 title = ""
             elif op == "ping":
                 return {"ok": True, "pong": True}

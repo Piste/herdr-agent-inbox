@@ -142,11 +142,11 @@ def build_lines(rows, mode):
         by_ws[r["workspace_id"]].append(r)
     for ws in order:
         group = by_ws[ws]
-        if mode == "compact":
-            lines.append(("header", "▾ %s — %s" % (group[0]["workspace"],
-                                                   _group_flag(group))))
-        else:
-            lines.append(("header", "▾ %s" % group[0]["workspace"]))
+        lines.append(("header", {
+            "workspace": group[0]["workspace"],
+            "flag": _group_flag(group) if mode == "compact" else None,
+            "count": len(group),
+        }))
         for r in group:
             lines.append(("row", r))
     return lines
@@ -193,7 +193,9 @@ def run(stdscr):
     curses.init_pair(1, curses.COLOR_RED, -1)      # blocked
     curses.init_pair(2, curses.COLOR_YELLOW, -1)   # done / unread
     curses.init_pair(3, curses.COLOR_GREEN, -1)    # working
-    curses.init_pair(4, curses.COLOR_CYAN, -1)     # headers
+    curses.init_pair(4, curses.COLOR_CYAN, -1)     # agent names / accents
+    curses.init_pair(5, curses.COLOR_BLUE, -1)     # folder icon
+    curses.init_pair(6, curses.COLOR_MAGENTA, -1)  # workspace names
     curses.mousemask(curses.ALL_MOUSE_EVENTS)
     stdscr.timeout(2000)  # refresh every 2s when idle
 
@@ -230,11 +232,31 @@ def run(stdscr):
         # Scroll so selection stays on screen.
         sel_line = row_idx[sel] if row_idx else 0
         first = max(0, min(sel_line - visible // 2, len(lines) - visible))
+        FLAG_ATTR = {
+            "!": curses.color_pair(1) | curses.A_BOLD,
+            "●": curses.color_pair(2) | curses.A_BOLD,
+            "▸": curses.color_pair(3),
+            "⚑": curses.A_DIM,
+            "○": curses.A_DIM,
+        }
+
+        def seg(yy, x, s, attr):
+            if x < w - 1 and s:
+                stdscr.addnstr(yy, x, s, w - 1 - x, attr)
+            return x + len(s)
+
         for y, i in enumerate(range(first, min(len(lines), first + visible))):
             kind, item = lines[i]
             if kind == "header":
-                stdscr.addnstr(top + y, 0, " " + item, w - 1,
-                               curses.color_pair(4) | curses.A_BOLD)
+                yy = top + y
+                x = seg(yy, 1, "📁", curses.color_pair(5)) + 2  # emoji is 2 cols
+                x = seg(yy, x, item["workspace"],
+                        curses.color_pair(6) | curses.A_BOLD)
+                if item.get("flag"):
+                    x = seg(yy, x, " — ", curses.A_DIM)
+                    seg(yy, x, item["flag"], FLAG_ATTR.get(item["flag"], 0))
+                else:
+                    seg(yy, x, "  (%d)" % item["count"], curses.A_DIM)
                 continue
             r = item
             icon = "⚑" if r["rank"] == "5" else (
@@ -248,16 +270,23 @@ def run(stdscr):
                 attr = curses.color_pair(3)
             elif r["rank"] == "5":
                 attr = curses.A_DIM
+            selected = bool(row_idx and i == row_idx[sel])
             if mode == "compact":
-                text = "   %s — %s" % (r["title"][: max(10, w - len(r["agent"]) - 10)],
-                                       r["agent"])
-            else:
-                meta = ("%s · %s" % (r["agent"], r["age"]) if mode == "grouped"
-                        else "%s · %s · %s" % (r["agent"], r["workspace"], r["age"]))
-                indent = "   " if mode == "grouped" else " "
-                avail = max(10, w - len(meta) - len(indent) - 7)
-                text = "%s%s %-*s  %s" % (indent, icon, avail, r["title"][:avail], meta)
-            if row_idx and i == row_idx[sel]:
+                yy = top + y
+                sel_attr = curses.A_REVERSE if selected else 0
+                if selected:
+                    stdscr.addnstr(yy, 0, " " * (w - 1), w - 1, sel_attr)
+                title = r["title"][: max(10, w - len(r["agent"]) - 12)]
+                x = seg(yy, 4, title, attr | sel_attr)
+                x = seg(yy, x, " — ", curses.A_DIM | sel_attr)
+                seg(yy, x, r["agent"], curses.color_pair(4) | sel_attr)
+                continue
+            meta = ("%s · %s" % (r["agent"], r["age"]) if mode == "grouped"
+                    else "%s · %s · %s" % (r["agent"], r["workspace"], r["age"]))
+            indent = "   " if mode == "grouped" else " "
+            avail = max(10, w - len(meta) - len(indent) - 7)
+            text = "%s%s %-*s  %s" % (indent, icon, avail, r["title"][:avail], meta)
+            if selected:
                 attr |= curses.A_REVERSE
             stdscr.addnstr(top + y, 0, text.ljust(w - 1), w - 1, attr)
         stdscr.refresh()
