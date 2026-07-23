@@ -30,7 +30,7 @@ STATUS_ICON = {
     "blocked": "!",
     "done": "●",
     "working": "▸",
-    "idle": "·",
+    "idle": "○",
     "unknown": "?",
 }
 

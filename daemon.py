@@ -648,11 +648,13 @@ class InboxDaemon:
                 else:
                     counts["idle"] += 1
             pieces = []
+            # Idle is "○", NOT "·" — herdr joins row tokens with a "·"
+            # separator, so a "·" glyph reads as a stray dash next to it.
             for key, sym in (
                 ("blocked", "!"),
                 ("attention", FLAG_UNREAD),
                 ("working", "▸"),   # ▸
-                ("idle", "·"),      # ·
+                ("idle", "○"),      # ○
                 ("settled", FLAG_SETTLED),
             ):
                 if not counts[key]:

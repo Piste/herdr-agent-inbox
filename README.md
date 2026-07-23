@@ -75,9 +75,10 @@ the summary lands or if the command fails.
 
 ## Sidebar rollup legend ($agents)
 
-`!2` blocked · `●1` finished-unseen/unread · `▸3` working · `·2` idle ·
+`!2` blocked · `●1` finished-unseen/unread · `▸3` working · `○2` idle ·
 `⚑1` settled. A workspace whose only content is a single idle agent shows
-nothing (the space's own status icon already conveys it).
+nothing (the space's own status icon already conveys it). Idle is `○`
+rather than `·` because herdr joins sidebar row tokens with a `·` separator.
 
 ## Install
 
