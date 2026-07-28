@@ -54,6 +54,17 @@ RANK_SETTLED = "5"
 FLAG_SETTLED = "⚑"   # ⚑
 FLAG_UNREAD = "●"    # ●
 
+# Agents whose native title we can only find by working directory (herdr
+# reports no session ref for them, or they never publish the title). Two live
+# panes of the same such agent in one directory are indistinguishable, so we
+# skip the lookup rather than risk labelling both with the same name. claude
+# and pi are keyed by their own transcript and are never ambiguous.
+CWD_KEYED_AGENTS = ("codex", "grok", "cursor", "hermes")
+
+# Bump when title extraction changes so cached titles are re-derived instead
+# of surviving forever in state.json.
+TITLE_ALGO = 2
+
 VIEW_SORT = [
     {"field": {"token": "rank"}, "order": "asc"},
     {"field": "state_change_seq", "order": "desc"},
@@ -527,29 +538,36 @@ def pi_native_title(path):
 
 
 def native_title_from_transcript(path):
-    """The agent's OWN session title, if it records one.
+    """claude-code's own name for the session, if it has one.
 
-    claude-code writes `{"type":"ai-title","aiTitle":...}` records and keeps
-    them current as the conversation evolves — the same name its own resume
-    picker shows. Scanning from the end gets the freshest one. pi and codex
-    record no session title today (their `title` keys are tool-activity and
-    web-page metadata), so they fall through to prompt-derived titles.
+    Two record types, both kept current as the conversation evolves:
+      {"type":"custom-title","customTitle":...}  a name YOU set (/title)
+      {"type":"ai-title","aiTitle":...}          claude's generated title
+    A custom title wins — it is an explicit choice — so scan from the end and
+    take the newest of each, preferring custom. This mirrors what claude's
+    own resume picker displays.
     """
     try:
         size = os.path.getsize(path)
         cap = 256 * 1024
         while True:
+            ai = None
             for line in reversed(_tail_lines(path, cap)):
-                if '"ai-title"' not in line:
+                if '"customTitle"' not in line and '"aiTitle"' not in line:
                     continue
                 try:
                     obj = json.loads(line)
                 except ValueError:
                     continue
-                if obj.get("type") == "ai-title":
-                    title = _clean_title(str(obj.get("aiTitle") or ""))
+                kind = obj.get("type")
+                if kind == "custom-title":
+                    title = _clean_title(str(obj.get("customTitle") or ""))
                     if title:
-                        return title
+                        return title  # explicit name beats the generated one
+                elif kind == "ai-title" and ai is None:
+                    ai = _clean_title(str(obj.get("aiTitle") or ""))
+            if ai:
+                return ai
             if cap >= min(size, 32 * 1024 * 1024):
                 return None
             cap *= 4
@@ -825,18 +843,41 @@ class InboxDaemon:
             st["sess_ref"] = sess_ref
             st["sess_kind"] = sess.get("kind")
             st["sess_value"] = sess.get("value")
-        sess_key = "%s:%s:%s:%s" % (sess.get("kind"), sess.get("value"),
-                                    self.cfg["title_source"],
-                                    self.cfg["prefer_agent_title"])
+        sess_key = "%s:%s:%s:%s:%s" % (sess.get("kind"), sess.get("value"),
+                                       self.cfg["title_source"],
+                                       self.cfg["prefer_agent_title"],
+                                       TITLE_ALGO)
         fresh = st.get("title_sess") == sess_key
-        # An agent that names its own session keeps renaming it as the work
-        # evolves — re-read it each tick so the sidebar tracks the agent.
-        if st.get("title_native"):
-            st["title_stale"] = True
         if st.get("title_manual") and st.get("title"):
             if fresh:
                 return
             st["title_manual"] = False  # new session ref supersedes manual title
+        path = resolve_transcript(rec)
+
+        # The agent's own name for the session is checked EVERY tick, before
+        # any cached-title shortcut: an agent renames its session as work
+        # evolves, and a session can gain a name long after it started.
+        # The ambiguity guard applies ONLY to cwd-keyed agents — claude and pi
+        # are looked up by their own transcript, so several of them in one
+        # directory are fine.
+        cwd_keyed = rec.get("agent") in CWD_KEYED_AGENTS
+        if self.cfg["prefer_agent_title"] \
+                and not (cwd_keyed
+                         and (rec.get("agent"), rec.get("cwd")) in self.ambiguous):
+            native = native_title_for(rec, path)
+            if native:
+                st["title_sess"] = sess_key
+                st["title_native"] = True
+                st["title_stale"] = False
+                if native != st.get("title"):
+                    st["title"] = native
+                    self.log("title (agent) %s -> %r" % (rec.get("pane_id"), native))
+                return
+            if st.get("title_native"):
+                # The agent's title went away (cleared) — re-derive our own.
+                st["title_native"] = False
+                st["title"] = None
+
         if st.get("title") and fresh and not st.get("title_stale"):
             return
         # Retry transcripts at most once per tick; they appear shortly after
@@ -849,37 +890,20 @@ class InboxDaemon:
             st["title"] = None
             st["sum_hash"] = None
         st["title_stale"] = False
-        path = resolve_transcript(rec)
-        # Agent-published session names first. grok/cursor are matched by
-        # cwd, so skip them when two live panes of the same agent share a
-        # directory — we could not tell which session is which.
-        if self.cfg["prefer_agent_title"] \
-                and (rec.get("agent"), rec.get("cwd")) not in self.ambiguous:
-            native = native_title_for(rec, path)
-            if native:
-                st["title_native"] = True
-                if native != st.get("title"):
-                    st["title"] = native
-                    self.log("title (agent) %s -> %r" % (rec.get("pane_id"), native))
-                return
         if not path:
             if not st.get("title"):
                 st["title"] = None
             return
+        # Native titles were already handled above; derive from prompts only.
         title, raw = title_from_transcript(path, self.cfg["title_source"],
-                                           self.cfg["prefer_agent_title"])
+                                           prefer_native=False)
         if not title:
             return
-        # raw is None for a native agent title: nothing to summarize, the
-        # agent already named it.
-        st["title_native"] = raw is None and self.cfg["prefer_agent_title"]
         summarize = bool(self.cfg["summarize"] and self.cfg["summarize_cmd"] and raw)
         if not summarize:
             if title != st.get("title"):
                 st["title"] = title
-                self.log("title%s %s -> %r"
-                         % (" (agent)" if st["title_native"] else "",
-                            rec.get("pane_id"), title))
+                self.log("title %s -> %r" % (rec.get("pane_id"), title))
             return
         h = hashlib.sha1(raw.encode()).hexdigest()[:12]
         if st.get("sum_hash") == h and st.get("title"):
