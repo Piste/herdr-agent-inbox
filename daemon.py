@@ -367,6 +367,41 @@ def _newest_json_title(candidates, keys, mtime_of=None):
     return best or (None, 0)
 
 
+def codex_native_title(cwd):
+    """codex keeps a per-thread `title` in ~/.codex/state_5.sqlite.
+
+    It is the verbatim first prompt rather than a short generated name, so it
+    gets truncated like any prompt-derived title — but it is authoritative,
+    already indexed by cwd, and works for panes with no session ref at all.
+    """
+    if not cwd:
+        return None
+    db = os.path.expanduser("~/.codex/state_5.sqlite")
+    if not os.path.exists(db):
+        return None
+    try:
+        import sqlite3
+        # Read-only URI so a live codex never blocks us and we never write.
+        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=0.5)
+        try:
+            con.execute("PRAGMA query_only = 1")
+            row = con.execute(
+                "SELECT title, preview, first_user_message FROM threads "
+                "WHERE cwd = ? AND archived = 0 "
+                "ORDER BY COALESCE(updated_at_ms, 0) DESC LIMIT 1",
+                (cwd,),
+            ).fetchone()
+        finally:
+            con.close()
+    except Exception:
+        return None
+    for value in row or ():
+        title = _clean_title(str(value or ""))
+        if title:
+            return title
+    return None
+
+
 def grok_native_title(cwd):
     """grok stores `generated_title` per session under a url-encoded cwd dir."""
     if not cwd:
@@ -433,17 +468,18 @@ def native_title_for(rec, path):
       grok         ~/.grok/sessions/<urlencoded cwd>/<id>/summary.json
                    -> generated_title                                    ✅
       cursor       ~/.cursor/chats/<md5 cwd>/<uuid>/meta.json -> title   ✅
-      codex        ~/.codex/state_5.sqlite threads.title is the verbatim
-                   first prompt (its `name` column is never set), so it
-                   is no better than what we derive ourselves            —
+      codex        ~/.codex/state_5.sqlite threads.title — the verbatim
+                   first prompt, used as-is (truncated)                  ✅
       pi, hermes   publish no session title                              —
 
-    grok and cursor are keyed by cwd (herdr reports no session ref for
-    them), so the newest session for that directory wins.
+    codex, grok and cursor are keyed by cwd (herdr reports no session ref
+    for them), so the newest session for that directory wins.
     """
     agent = rec.get("agent")
     if agent == "claude" and path:
         return native_title_from_transcript(path)
+    if agent == "codex":
+        return codex_native_title(rec.get("cwd"))
     if agent == "grok":
         return grok_native_title(rec.get("cwd"))
     if agent == "cursor":
