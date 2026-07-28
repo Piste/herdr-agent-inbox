@@ -94,6 +94,7 @@ def config_file():
 
 DEFAULT_CONFIG = {
     "title_source": "first",       # "first" | "last" user prompt
+    "prefer_agent_title": True,    # use the agent's own session name when it has one
     "summarize": False,            # pipe the prompt through summarize_cmd
     "summarize_cmd": "",           # shell cmd: prompt on stdin -> title on stdout
     "summarize_timeout_secs": 60,
@@ -103,7 +104,12 @@ CONFIG_TEMPLATE = """\
 # herdr-agent-inbox configuration
 
 [title]
-# Which user prompt seeds the session title:
+# Prefer the title the AGENT ITSELF gives the session, when it records one
+# (claude-code's own session name; pi/codex don't publish one yet). Falls back
+# to the prompt-derived title below whenever no native title exists.
+prefer_agent_title = true
+
+# Which user prompt seeds the session title when there's no native one:
 #   "first" — the opening request, like ChatGPT/Claude chat titles
 #   "last"  — the most recent request; re-derived when the agent finishes a turn
 source = "first"
@@ -137,6 +143,8 @@ def load_config():
         src = title.get("source")
         if src in ("first", "last"):
             cfg["title_source"] = src
+        if "prefer_agent_title" in title:
+            cfg["prefer_agent_title"] = bool(title["prefer_agent_title"])
         cfg["summarize"] = bool(title.get("summarize", False))
         cmd = title.get("summarize_cmd")
         if isinstance(cmd, str):
@@ -331,12 +339,49 @@ def _tail_lines(path, max_bytes=512 * 1024):
     return [ln.decode("utf-8", "replace") for ln in lines]
 
 
-def title_from_transcript(path, source="first"):
+def native_title_from_transcript(path):
+    """The agent's OWN session title, if it records one.
+
+    claude-code writes `{"type":"ai-title","aiTitle":...}` records and keeps
+    them current as the conversation evolves — the same name its own resume
+    picker shows. Scanning from the end gets the freshest one. pi and codex
+    record no session title today (their `title` keys are tool-activity and
+    web-page metadata), so they fall through to prompt-derived titles.
+    """
+    try:
+        size = os.path.getsize(path)
+        cap = 256 * 1024
+        while True:
+            for line in reversed(_tail_lines(path, cap)):
+                if '"ai-title"' not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if obj.get("type") == "ai-title":
+                    title = _clean_title(str(obj.get("aiTitle") or ""))
+                    if title:
+                        return title
+            if cap >= min(size, 32 * 1024 * 1024):
+                return None
+            cap *= 4
+    except OSError:
+        return None
+
+
+def title_from_transcript(path, source="first", prefer_native=True):
     """(clean_title, raw_prompt) from a session transcript.
 
+    A native agent title wins when present (raw is None so it is never sent
+    to the summarizer — the agent already named it).
     source "first": the opening user prompt (preferring claude summary lines).
     source "last":  the most recent user prompt (tail-scanned).
     """
+    if prefer_native:
+        native = native_title_from_transcript(path)
+        if native:
+            return native, None
     try:
         if source == "last":
             # Transcript lines can be huge (base64 images in tool results), so
@@ -553,9 +598,14 @@ class InboxDaemon:
             st["sess_ref"] = sess_ref
             st["sess_kind"] = sess.get("kind")
             st["sess_value"] = sess.get("value")
-        sess_key = "%s:%s:%s" % (sess.get("kind"), sess.get("value"),
-                                 self.cfg["title_source"])
+        sess_key = "%s:%s:%s:%s" % (sess.get("kind"), sess.get("value"),
+                                    self.cfg["title_source"],
+                                    self.cfg["prefer_agent_title"])
         fresh = st.get("title_sess") == sess_key
+        # An agent that names its own session keeps renaming it as the work
+        # evolves — re-read it each tick so the sidebar tracks the agent.
+        if st.get("title_native"):
+            st["title_stale"] = True
         if st.get("title_manual") and st.get("title"):
             if fresh:
                 return
@@ -577,14 +627,20 @@ class InboxDaemon:
             if not st.get("title"):
                 st["title"] = None
             return
-        title, raw = title_from_transcript(path, self.cfg["title_source"])
+        title, raw = title_from_transcript(path, self.cfg["title_source"],
+                                           self.cfg["prefer_agent_title"])
         if not title:
             return
+        # raw is None for a native agent title: nothing to summarize, the
+        # agent already named it.
+        st["title_native"] = raw is None and self.cfg["prefer_agent_title"]
         summarize = bool(self.cfg["summarize"] and self.cfg["summarize_cmd"] and raw)
         if not summarize:
             if title != st.get("title"):
                 st["title"] = title
-                self.log("title %s -> %r" % (rec.get("pane_id"), title))
+                self.log("title%s %s -> %r"
+                         % (" (agent)" if st["title_native"] else "",
+                            rec.get("pane_id"), title))
             return
         h = hashlib.sha1(raw.encode()).hexdigest()[:12]
         if st.get("sum_hash") == h and st.get("title"):
@@ -759,6 +815,12 @@ class InboxDaemon:
                     self.ws_report[ws] = tokens
         except (OSError, RuntimeError) as e:
             self.log("ws metadata %s failed: %s" % (ws, e))
+            if tokens.get("agents") is None:
+                # Clearing a workspace that no longer exists (e.g. ids
+                # regenerated by a server handoff) can never succeed — drop
+                # it instead of retrying every tick forever.
+                with self.lock:
+                    self.ws_report.pop(ws, None)
 
     def _workspace_report_items(self, ws_agents):
         """Compute per-workspace rollup tokens; returns [(ws, tokens)] for
