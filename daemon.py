@@ -402,6 +402,50 @@ def codex_native_title(cwd):
     return None
 
 
+def _sqlite_scalar(db, sql, params):
+    """One read-only scalar query; never blocks or writes the agent's db."""
+    if not os.path.exists(db):
+        return None
+    try:
+        import sqlite3
+        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=0.5)
+        try:
+            con.execute("PRAGMA query_only = 1")
+            row = con.execute(sql, params).fetchone()
+        finally:
+            con.close()
+    except Exception:
+        return None
+    return row
+
+
+def hermes_native_title(cwd):
+    """hermes auto-titles sessions into ~/.hermes/profiles/<p>/state.db
+    (`sessions.title`, best-effort and only set while NULL). It reports a
+    session id + lifecycle state to herdr but never the title, so match on
+    cwd across profiles, preferring a session that is still running."""
+    if not cwd:
+        return None
+    best = None
+    for db in glob.glob(os.path.expanduser("~/.hermes/profiles/*/state.db")):
+        row = _sqlite_scalar(
+            db,
+            "SELECT title, ended_at IS NULL AS live, COALESCE(started_at, '') "
+            "FROM sessions WHERE cwd = ? AND COALESCE(archived, 0) = 0 "
+            "AND title IS NOT NULL AND title != '' "
+            "ORDER BY live DESC, started_at DESC LIMIT 1",
+            (cwd,),
+        )
+        if not row:
+            continue
+        title = _clean_title(str(row[0] or ""))
+        if title:
+            rank = (row[1] or 0, row[2] or "")
+            if best is None or rank > best[1]:
+                best = (title, rank)
+    return best[0] if best else None
+
+
 def grok_native_title(cwd):
     """grok stores `generated_title` per session under a url-encoded cwd dir."""
     if not cwd:
@@ -427,6 +471,34 @@ def cursor_native_title(cwd):
         ("title",),
         mtime_of=lambda d: (d.get("updatedAtMs") or 0) / 1000.0 or None,
     )[0]
+
+
+def pi_native_title(path):
+    """pi never auto-generates a title, but a name the user sets (`/name`,
+    `--name`, picker rename, RPC set_session_name) is appended to the same
+    transcript as {"type":"session_info","name":...}; the latest one wins and
+    an empty name clears it — matching what pi's own resume picker shows."""
+    if not path:
+        return None
+    try:
+        size = os.path.getsize(path)
+        cap = 256 * 1024
+        while True:
+            for line in reversed(_tail_lines(path, cap)):
+                if '"session_info"' not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if obj.get("type") == "session_info" and "name" in obj:
+                    # An empty name is pi's way of clearing it.
+                    return _clean_title(str(obj.get("name") or "")) or None
+            if cap >= min(size, 32 * 1024 * 1024):
+                return None
+            cap *= 4
+    except OSError:
+        return None
 
 
 def native_title_from_transcript(path):
@@ -470,16 +542,25 @@ def native_title_for(rec, path):
       cursor       ~/.cursor/chats/<md5 cwd>/<uuid>/meta.json -> title   ✅
       codex        ~/.codex/state_5.sqlite threads.title — the verbatim
                    first prompt, used as-is (truncated)                  ✅
-      pi, hermes   publish no session title                              —
+      pi           no auto-title, but a user-set name lands in the same
+                   transcript as {"type":"session_info","name":...}      ✅
+      hermes       auto-titles into ~/.hermes/profiles/*/state.db
+                   sessions.title (reports its id to herdr, never the
+                   title), so read the db directly                       ✅
 
-    codex, grok and cursor are keyed by cwd (herdr reports no session ref
-    for them), so the newest session for that directory wins.
+    codex, grok, cursor and hermes are keyed by cwd (herdr gets no session
+    ref for the first three, and hermes never reports its title), so the
+    newest session for that directory wins.
     """
     agent = rec.get("agent")
     if agent == "claude" and path:
         return native_title_from_transcript(path)
     if agent == "codex":
         return codex_native_title(rec.get("cwd"))
+    if agent == "pi" and path:
+        return pi_native_title(path)
+    if agent == "hermes":
+        return hermes_native_title(rec.get("cwd"))
     if agent == "grok":
         return grok_native_title(rec.get("cwd"))
     if agent == "cursor":
