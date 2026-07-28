@@ -155,6 +155,22 @@ summarize_cmd = "claude -p --model claude-haiku-4-5-20251001 'Write a 4-8 word t
 summarize_timeout_secs = 60
 ```
 
+### Auto-renaming tabs
+
+```toml
+[tab]
+rename_from_agent_title = true   # tab label follows the agent's session title
+max_chars = 24                   # truncate, appending `ellipsis`
+ellipsis = "…"
+respect_manual = true            # never overwrite a label you typed
+```
+
+A tab is managed only while its label is herdr's default (the tab number) or
+the exact label the plugin last set — rename a tab yourself and the plugin
+leaves it alone forever after; reset it to the number to hand control back.
+When a tab holds several agents, the most attention-worthy one names it
+(blocked → unseen → working → idle → settled, most recent first).
+
 `source = "last"` re-derives the title whenever the agent finishes a turn.
 Summaries run on an async worker, cached per prompt content (one call per
 session), falling back to the truncated raw prompt until they land. Agents

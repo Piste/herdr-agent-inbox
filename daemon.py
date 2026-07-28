@@ -98,6 +98,10 @@ DEFAULT_CONFIG = {
     "summarize": False,            # pipe the prompt through summarize_cmd
     "summarize_cmd": "",           # shell cmd: prompt on stdin -> title on stdout
     "summarize_timeout_secs": 60,
+    "tab_rename": False,           # rename tabs to their agent's session title
+    "tab_max_chars": 24,           # truncate the label to this many characters
+    "tab_ellipsis": "…",           # appended when the title is truncated
+    "tab_respect_manual": True,    # never overwrite a label you set yourself
 }
 
 CONFIG_TEMPLATE = """\
@@ -120,6 +124,18 @@ source = "first"
 summarize = false
 summarize_cmd = "claude -p --model claude-haiku-4-5-20251001 'Write a 4-8 word title for this coding-agent session request. Output ONLY the title, nothing else.'"
 summarize_timeout_secs = 60
+
+[tab]
+# Rename each tab to its agent's session title automatically.
+rename_from_agent_title = false
+
+# Truncate the label to this many characters, appending `ellipsis` when cut.
+max_chars = 24
+ellipsis = "…"
+
+# Never touch a tab you named yourself: a tab is only managed while its label
+# is herdr's default (the tab number) or the last label this plugin set.
+respect_manual = true
 """
 
 
@@ -152,6 +168,15 @@ def load_config():
         t = title.get("summarize_timeout_secs")
         if isinstance(t, int) and 5 <= t <= 600:
             cfg["summarize_timeout_secs"] = t
+        tab = data.get("tab") or {}
+        cfg["tab_rename"] = bool(tab.get("rename_from_agent_title", False))
+        n = tab.get("max_chars")
+        if isinstance(n, int) and 4 <= n <= 200:
+            cfg["tab_max_chars"] = n
+        ell = tab.get("ellipsis")
+        if isinstance(ell, str) and len(ell) <= 4:
+            cfg["tab_ellipsis"] = ell
+        cfg["tab_respect_manual"] = bool(tab.get("respect_manual", True))
     except (OSError, ValueError) as e:
         sys.stderr.write("config load failed: %s\n" % e)
     return cfg
@@ -662,6 +687,7 @@ class InboxDaemon:
         self.cfg = load_config()
         self.cfg_mtime = self._cfg_mtime()
         self.ambiguous = set()    # (agent, cwd) pairs with >1 live pane
+        self.tab_labels = {}      # tab_id -> label WE set (never clobber yours)
         self.sum_q = queue.Queue()
         self.sum_inflight = set()  # (tid, hash) queued or running
         self.sum_failed = set()    # hashes that failed this run; don't retry
@@ -674,6 +700,7 @@ class InboxDaemon:
             with open(self.state_path) as f:
                 data = json.load(f)
             self.terminals = data.get("terminals", {})
+            self.tab_labels = data.get("tab_labels", {}) or {}
         except (OSError, ValueError):
             self.terminals = {}
 
@@ -681,7 +708,8 @@ class InboxDaemon:
         tmp = self.state_path + ".tmp"
         try:
             with open(tmp, "w") as f:
-                json.dump({"terminals": self.terminals}, f)
+                json.dump({"terminals": self.terminals,
+                           "tab_labels": self.tab_labels}, f)
             os.replace(tmp, self.state_path)
         except OSError as e:
             self.log("state save failed: %s" % e)
@@ -913,6 +941,7 @@ class InboxDaemon:
             pass
         pending = []
         ws_pending = []
+        tab_best = {}
         seen_pairs = {}
         for rec in agents:
             key = (rec.get("agent"), rec.get("cwd"))
@@ -985,6 +1014,16 @@ class InboxDaemon:
                 }
                 pending.append(self._pane_report_item(pane_id, tid, st, tokens))
 
+                # Per tab, the most attention-worthy agent names the tab
+                # (rank asc, then most recent state change) — stable when a
+                # tab holds several agents.
+                tab_id = rec.get("tab_id")
+                if tab_id and st.get("title"):
+                    key = (rank, -(rec.get("state_change_seq") or 0))
+                    prev = tab_best.get(tab_id)
+                    if prev is None or key < prev[0]:
+                        tab_best[tab_id] = (key, st["title"])
+
                 ws = rec.get("workspace_id")
                 if ws:
                     ws_agents.setdefault(ws, []).append((status, st, now))
@@ -999,6 +1038,10 @@ class InboxDaemon:
                 self._send_pane_report(*item)
         for ws, tokens in ws_pending:
             self._send_ws_report(ws, tokens)
+        if self.cfg["tab_rename"]:
+            titles = {t: v[1] for t, v in tab_best.items()}
+            for tab_id, label in self._tab_rename_items(titles):
+                self._send_tab_rename(tab_id, label)
 
     def _pane_report_item(self, pane_id, tid, st, tokens):
         meta_title = st.get("title")  # only override the pane title if generated
@@ -1037,6 +1080,68 @@ class InboxDaemon:
                 # it instead of retrying every tick forever.
                 with self.lock:
                     self.ws_report.pop(ws, None)
+
+    def _tab_label_for(self, title):
+        """Truncate a session title to the configured tab-label length."""
+        limit = self.cfg["tab_max_chars"]
+        title = _WS_RE.sub(" ", title).strip()
+        if len(title) <= limit:
+            return title
+        ell = self.cfg["tab_ellipsis"]
+        cut = title[: max(1, limit - len(ell))]
+        # Prefer a word boundary when one is reasonably close to the cut.
+        if " " in cut[max(1, len(cut) // 2):]:
+            cut = cut[: cut.rfind(" ")]
+        return cut.rstrip(" ,;:.-") + ell
+
+    def _tab_rename_items(self, tab_titles):
+        """[(tab_id, label)] for tabs whose label should change.
+
+        A tab is only managed while its label is herdr's default (the tab
+        number) or the exact label this plugin last set — so a name you type
+        yourself is never overwritten. Renaming one manually also releases
+        the tab from management until it goes back to a default label.
+        """
+        items = []
+        try:
+            workspaces = herdr_request("workspace.list", {}).get("workspaces", [])
+        except (OSError, RuntimeError):
+            return items
+        managed = self.tab_labels
+        live = set()
+        for ws in workspaces:
+            ws_id = ws.get("workspace_id")
+            try:
+                tabs = herdr_request("tab.list", {"workspace_id": ws_id}).get("tabs", [])
+            except (OSError, RuntimeError):
+                continue
+            for tab in tabs:
+                tab_id = tab.get("tab_id")
+                live.add(tab_id)
+                want = tab_titles.get(tab_id)
+                if not want:
+                    continue
+                label = tab.get("label") or ""
+                default = str(tab.get("number", ""))
+                ours = managed.get(tab_id)
+                if self.cfg["tab_respect_manual"] \
+                        and label not in ("", default) and label != ours:
+                    continue  # a name Douglas typed — leave it alone
+                want = self._tab_label_for(want)
+                if want and want != label:
+                    items.append((tab_id, want))
+        for gone in [t for t in managed if t not in live]:
+            managed.pop(gone, None)
+        return items
+
+    def _send_tab_rename(self, tab_id, label):
+        try:
+            herdr_request("tab.rename", {"tab_id": tab_id, "label": label})
+            with self.lock:
+                self.tab_labels[tab_id] = label
+            self.log("tab %s -> %r" % (tab_id, label))
+        except (OSError, RuntimeError) as e:
+            self.log("tab rename %s failed: %s" % (tab_id, e))
 
     def _workspace_report_items(self, ws_agents):
         """Compute per-workspace rollup tokens; returns [(ws, tokens)] for
