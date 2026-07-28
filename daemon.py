@@ -339,6 +339,61 @@ def _tail_lines(path, max_bytes=512 * 1024):
     return [ln.decode("utf-8", "replace") for ln in lines]
 
 
+def _newest_json_title(candidates, keys, mtime_of=None):
+    """(title, mtime) from the most recently touched candidate JSON file.
+
+    candidates: iterable of file paths; keys: field names to try in order;
+    mtime_of: optional callable(dict) -> sortable recency from file content.
+    """
+    best = None
+    for path in candidates:
+        try:
+            stamp = os.path.getmtime(path)
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        if mtime_of:
+            stamp = mtime_of(data) or stamp
+        title = None
+        for key in keys:
+            title = _clean_title(str(data.get(key) or ""))
+            if title:
+                break
+        if title and (best is None or stamp > best[1]):
+            best = (title, stamp)
+    return best or (None, 0)
+
+
+def grok_native_title(cwd):
+    """grok stores `generated_title` per session under a url-encoded cwd dir."""
+    if not cwd:
+        return None
+    import urllib.parse
+    root = os.path.expanduser(
+        "~/.grok/sessions/%s" % urllib.parse.quote(cwd, safe="")
+    )
+    return _newest_json_title(
+        glob.glob(os.path.join(root, "*", "summary.json")),
+        ("generated_title", "session_summary"),
+    )[0]
+
+
+def cursor_native_title(cwd):
+    """cursor-agent stores `title` per chat under md5(cwd)/<chat-uuid>/."""
+    if not cwd:
+        return None
+    digest = hashlib.md5(cwd.encode()).hexdigest()
+    root = os.path.expanduser("~/.cursor/chats/%s" % digest)
+    return _newest_json_title(
+        glob.glob(os.path.join(root, "*", "meta.json")),
+        ("title",),
+        mtime_of=lambda d: (d.get("updatedAtMs") or 0) / 1000.0 or None,
+    )[0]
+
+
 def native_title_from_transcript(path):
     """The agent's OWN session title, if it records one.
 
@@ -368,6 +423,32 @@ def native_title_from_transcript(path):
             cap *= 4
     except OSError:
         return None
+
+
+def native_title_for(rec, path):
+    """The session name the AGENT ITSELF gives this conversation, or None.
+
+    Where each agent keeps it (verified 2026-07-28):
+      claude       transcript records {"type":"ai-title","aiTitle":...}   ✅
+      grok         ~/.grok/sessions/<urlencoded cwd>/<id>/summary.json
+                   -> generated_title                                    ✅
+      cursor       ~/.cursor/chats/<md5 cwd>/<uuid>/meta.json -> title   ✅
+      codex        ~/.codex/state_5.sqlite threads.title is the verbatim
+                   first prompt (its `name` column is never set), so it
+                   is no better than what we derive ourselves            —
+      pi, hermes   publish no session title                              —
+
+    grok and cursor are keyed by cwd (herdr reports no session ref for
+    them), so the newest session for that directory wins.
+    """
+    agent = rec.get("agent")
+    if agent == "claude" and path:
+        return native_title_from_transcript(path)
+    if agent == "grok":
+        return grok_native_title(rec.get("cwd"))
+    if agent == "cursor":
+        return cursor_native_title(rec.get("cwd"))
+    return None
 
 
 def title_from_transcript(path, source="first", prefer_native=True):
@@ -463,6 +544,7 @@ class InboxDaemon:
         self.pane_to_tid = {}     # pane_id -> terminal_id (from last refresh)
         self.cfg = load_config()
         self.cfg_mtime = self._cfg_mtime()
+        self.ambiguous = set()    # (agent, cwd) pairs with >1 live pane
         self.sum_q = queue.Queue()
         self.sum_inflight = set()  # (tid, hash) queued or running
         self.sum_failed = set()    # hashes that failed this run; don't retry
@@ -623,6 +705,18 @@ class InboxDaemon:
             st["sum_hash"] = None
         st["title_stale"] = False
         path = resolve_transcript(rec)
+        # Agent-published session names first. grok/cursor are matched by
+        # cwd, so skip them when two live panes of the same agent share a
+        # directory — we could not tell which session is which.
+        if self.cfg["prefer_agent_title"] \
+                and (rec.get("agent"), rec.get("cwd")) not in self.ambiguous:
+            native = native_title_for(rec, path)
+            if native:
+                st["title_native"] = True
+                if native != st.get("title"):
+                    st["title"] = native
+                    self.log("title (agent) %s -> %r" % (rec.get("pane_id"), native))
+                return
         if not path:
             if not st.get("title"):
                 st["title"] = None
@@ -702,6 +796,11 @@ class InboxDaemon:
             pass
         pending = []
         ws_pending = []
+        seen_pairs = {}
+        for rec in agents:
+            key = (rec.get("agent"), rec.get("cwd"))
+            seen_pairs[key] = seen_pairs.get(key, 0) + 1
+        self.ambiguous = {k for k, n in seen_pairs.items() if n > 1}
         with self.lock:
             self.pane_to_tid = {}
             seen_tids = set()
