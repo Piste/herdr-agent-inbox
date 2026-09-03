@@ -10,6 +10,7 @@ from unittest import mock
 import daemon
 import inbox_tui
 import restore
+import snooze_time
 
 
 def agent(status="idle"):
@@ -64,6 +65,57 @@ class ArchiveTests(unittest.TestCase):
         self.assertTrue(response["ok"])
         self.assertTrue(obj.terminals["term-1"]["unread"])
         self.assertNotIn("append", events)
+
+    def test_migration_notes_find_removed_and_native_key_collisions(self):
+        config = '''
+[keys]
+[[keys.command]]
+key = "prefix+m"
+command = "herdr plugin action invoke settle --plugin herdr-agent-inbox"
+
+[[keys.command]]
+key = "prefix+e"
+command = "herdr plugin action invoke archive --plugin herdr-agent-inbox"
+'''
+        self.assertEqual(
+            daemon.keybinding_migration_notes(config), ["settle", "prefix-e"])
+
+    def test_migration_notes_leave_safe_public_binding_alone(self):
+        config = '''
+[keys]
+[[keys.command]]
+key = "prefix+i"
+command = "herdr plugin pane open --plugin herdr-agent-inbox --entrypoint inbox"
+
+[[keys.command]]
+key = "prefix+a"
+command = "herdr plugin action invoke archive --plugin herdr-agent-inbox"
+'''
+        self.assertEqual(daemon.keybinding_migration_notes(config), [])
+
+    def test_migration_notification_is_read_only_and_one_time(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "config.toml")
+            with open(path, "w") as handle:
+                handle.write('''
+[keys]
+[[keys.command]]
+key = "prefix+e"
+command = "herdr plugin action invoke archive --plugin herdr-agent-inbox"
+''')
+            obj = daemon.InboxDaemon.__new__(daemon.InboxDaemon)
+            obj.notices = {}
+            obj.log = mock.Mock()
+            obj._save = mock.Mock()
+            result = mock.Mock(returncode=0)
+            with mock.patch.dict(os.environ, {"HERDR_CONFIG_PATH": path}), \
+                    mock.patch.object(daemon.subprocess, "run", return_value=result) as run:
+                obj._warn_keybinding_migration()
+                obj._warn_keybinding_migration()
+            run.assert_called_once()
+            obj._save.assert_called_once()
+            with open(path) as handle:
+                self.assertIn('key = "prefix+e"', handle.read())
 
     def test_archive_is_durable_before_close(self):
         events = []
@@ -294,6 +346,108 @@ class SnoozeTests(unittest.TestCase):
             "1-oct 14:30 ask cat", now=now)
         self.assertEqual(datetime.fromtimestamp(wake_at), datetime(2026, 10, 1, 14, 30))
         self.assertEqual(reminder, "ask cat")
+
+    def test_todoist_style_time_spellings(self):
+        now = datetime(2026, 9, 3, 10, 0).timestamp()
+        for spec in ("3 pm", "3pm", "3p"):
+            with self.subTest(spec=spec):
+                wake_at, reminder = daemon.parse_snooze_spec(spec, now=now)
+                self.assertEqual(
+                    datetime.fromtimestamp(wake_at), datetime(2026, 9, 3, 15, 0))
+                self.assertEqual(reminder, "")
+
+    def test_bare_time_uses_its_next_occurrence(self):
+        now = datetime(2026, 9, 3, 16, 0).timestamp()
+        wake_at, _ = daemon.parse_snooze_spec("3p", now=now)
+        self.assertEqual(
+            datetime.fromtimestamp(wake_at), datetime(2026, 9, 4, 15, 0))
+
+    def test_tomorrow_alias_with_time_and_reminder(self):
+        now = datetime(2026, 9, 3, 10, 0).timestamp()
+        wake_at, reminder = daemon.parse_snooze_spec(
+            "tom 3p ask cat when back", now=now)
+        self.assertEqual(
+            datetime.fromtimestamp(wake_at), datetime(2026, 9, 4, 15, 0))
+        self.assertEqual(reminder, "ask cat when back")
+
+    def test_month_first_date_with_time_and_reminder(self):
+        now = datetime(2026, 9, 3, 10, 0).timestamp()
+        wake_at, reminder = daemon.parse_snooze_spec(
+            "sep 4 3p tickets should be available", now=now)
+        self.assertEqual(
+            datetime.fromtimestamp(wake_at), datetime(2026, 9, 4, 15, 0))
+        self.assertEqual(reminder, "tickets should be available")
+
+    def test_natural_relative_forms(self):
+        now = datetime(2026, 9, 3, 10, 0).timestamp()
+        cases = {
+            "in 15 minutes": 15 * 60,
+            "+5 days": 5 * 86400,
+            "2 weeks": 14 * 86400,
+            "1.5h": 90 * 60,
+            "1h30m": 90 * 60,
+            "1 hour and 30 minutes": 90 * 60,
+            "an hour": 60 * 60,
+        }
+        for spec, delta in cases.items():
+            with self.subTest(spec=spec):
+                wake_at, _ = daemon.parse_snooze_spec(spec, now=now)
+                self.assertEqual(wake_at, now + delta)
+
+    def test_named_days_weekdays_and_parts_of_day(self):
+        now = datetime(2026, 9, 3, 10, 0).timestamp()  # Thursday
+        cases = {
+            "tom morning": datetime(2026, 9, 4, 9, 0),
+            "fri 7pm": datetime(2026, 9, 4, 19, 0),
+            "fri at 1900": datetime(2026, 9, 4, 19, 0),
+            "next fri 7p": datetime(2026, 9, 11, 19, 0),
+            "next week": datetime(2026, 9, 7, 9, 0),
+            "end of month": datetime(2026, 9, 30, 9, 0),
+        }
+        for spec, expected in cases.items():
+            with self.subTest(spec=spec):
+                wake_at, _ = daemon.parse_snooze_spec(spec, now=now)
+                self.assertEqual(datetime.fromtimestamp(wake_at), expected)
+
+    def test_common_date_orders_and_ordinal(self):
+        now = datetime(2026, 9, 3, 10, 0).timestamp()
+        cases = {
+            "September 4th at 3:30 pm": datetime(2026, 9, 4, 15, 30),
+            "4 sep 15:30": datetime(2026, 9, 4, 15, 30),
+            "2026-09-04T15:30": datetime(2026, 9, 4, 15, 30),
+        }
+        for spec, expected in cases.items():
+            with self.subTest(spec=spec):
+                wake_at, _ = daemon.parse_snooze_spec(spec, now=now)
+                self.assertEqual(datetime.fromtimestamp(wake_at), expected)
+
+    def test_feedback_shows_interpretation_and_reminder(self):
+        now = datetime(2026, 9, 3, 10, 0).timestamp()
+        feedback, valid = snooze_time.snooze_feedback(
+            "tom 3p ask cat when back", now=now)
+        self.assertTrue(valid)
+        self.assertIn("tomorrow at 3:00 PM", feedback)
+        self.assertIn("reminder: ask cat when back", feedback)
+
+    def test_feedback_makes_parse_error_visible(self):
+        feedback, valid = snooze_time.snooze_feedback("perhaps after lunch")
+        self.assertFalse(valid)
+        self.assertIn("couldn't understand", feedback)
+        self.assertIn("tom 3p", feedback)
+
+    def test_invalid_clock_is_not_silently_used_as_reminder(self):
+        now = datetime(2026, 9, 3, 10, 0).timestamp()
+        with self.assertRaisesRegex(ValueError, "hour from 00 to 23"):
+            daemon.parse_snooze_spec("tom 28:90 call Sam", now=now)
+
+    def test_recurring_expression_explains_limitation(self):
+        with self.assertRaisesRegex(ValueError, "recurring snoozes aren't supported"):
+            daemon.parse_snooze_spec("every friday at 3pm")
+
+    def test_explicit_past_date_is_rejected_clearly(self):
+        now = datetime(2026, 9, 3, 10, 0).timestamp()
+        with self.assertRaisesRegex(ValueError, "already passed"):
+            daemon.parse_snooze_spec("2026-09-02 3pm", now=now)
 
     def test_invalid_snooze_requires_time_expression(self):
         with self.assertRaisesRegex(ValueError, "duration.*date"):

@@ -33,9 +33,9 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime
 
 import restore
+from snooze_time import parse_snooze_spec
 
 try:
     import tomllib
@@ -54,7 +54,6 @@ RANK_WORKING = "2"
 RANK_IDLE = "3"
 RANK_UNKNOWN = "4"
 FLAG_DONE = "●"
-SNOOZE_MESSAGE_MAX = 240
 
 # Agents whose native title we can only find by working directory (herdr
 # reports no session ref for them, or they never publish the title). Two live
@@ -104,6 +103,50 @@ def config_file():
         os.path.dirname(herdr_socket_path()), "plugins", "config", "herdr-agent-inbox"
     )
     return os.path.join(d, "config.toml")
+
+
+def herdr_config_file():
+    return os.path.realpath(os.environ.get("HERDR_CONFIG_PATH") or os.path.expanduser(
+        "~/.config/herdr/config.toml"
+    ))
+
+
+def keybinding_migration_notes(text):
+    """Find stale/surprising bindings without ever modifying user config."""
+    bindings = []
+    if tomllib is not None:
+        try:
+            data = tomllib.loads(text)
+            bindings = ((data.get("keys") or {}).get("command") or [])
+        except (TypeError, ValueError):
+            bindings = []
+    if not bindings:
+        # Good-enough fallback for Python <3.11 or a temporarily invalid TOML
+        # file. Ignore full-line comments so examples do not trigger a toast.
+        active = "\n".join(line for line in text.splitlines()
+                           if not line.lstrip().startswith("#"))
+        for block in re.split(r"(?m)^\s*\[\[keys\.command\]\]\s*$", active)[1:]:
+            key = re.search(r'(?m)^\s*key\s*=\s*["\']([^"\']+)', block)
+            command = re.search(r'(?m)^\s*command\s*=\s*["\']([^"\']+)', block)
+            bindings.append({"key": key.group(1) if key else "",
+                             "command": command.group(1) if command else ""})
+
+    notes = []
+    for binding in bindings:
+        if not isinstance(binding, dict):
+            continue
+        key = str(binding.get("key") or "").lower().replace(" ", "")
+        command = str(binding.get("command") or "")
+        if "herdr-agent-inbox" not in command:
+            continue
+        if re.search(r"\baction\s+invoke\s+settle(?:-workspace)?\b", command):
+            if "settle" not in notes:
+                notes.append("settle")
+        if (key == "prefix+e"
+                and re.search(r"\baction\s+invoke\s+archive\b", command)):
+            if "prefix-e" not in notes:
+                notes.append("prefix-e")
+    return notes
 
 
 DEFAULT_CONFIG = {
@@ -264,111 +307,11 @@ def fmt_dur(secs):
     return "%dd%dh" % (d, h) if h else "%dd" % d
 
 
-_SNOOZE_RELATIVE_RE = re.compile(r"^(\d+)([mhdw])$", re.I)
-_SNOOZE_ISO_RE = re.compile(
-    r"^(\d{4})-(\d{1,2})-(\d{1,2})(?:[T@](\d{1,2}):(\d{2}))?$", re.I)
-_SNOOZE_NAMED_RE = re.compile(
-    r"^(\d{1,2})-([a-z]{3,9})(?:-(\d{4}))?(?:[T@](\d{1,2}):(\d{2}))?$", re.I)
-_SNOOZE_CLOCK_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
-_MONTHS = {
-    name: number
-    for number, names in enumerate((
-        (), ("jan", "january"), ("feb", "february"),
-        ("mar", "march"), ("apr", "april"), ("may",),
-        ("jun", "june"), ("jul", "july"), ("aug", "august"),
-        ("sep", "sept", "september"), ("oct", "october"),
-        ("nov", "november"), ("dec", "december"),
-    ))
-    for name in names
-}
-
-
 def _safe_float(value, default=0.0):
     try:
         return float(value)
     except (TypeError, ValueError, OverflowError):
         return default
-
-
-def parse_snooze_spec(text, now=None):
-    """Parse ``<when> [reminder]`` into (wake timestamp, reminder).
-
-    Supported deadlines are relative ``15m``/``3h``/``5d``/``2w`` values,
-    ISO dates, and human dates such as ``1-oct``. A separate ``HH:MM`` token
-    or ``@HH:MM`` suffix overrides the 09:00 date-only default. Everything
-    after the deadline is a reminder for the human; it is never sent to the
-    resumed agent.
-    """
-    raw = str(text or "").strip()
-    if not raw:
-        raise ValueError("enter a duration or date, e.g. 3h or 1-oct")
-    words = raw.split()
-    when = words[0]
-    rest_at = 1
-    now_ts = time.time() if now is None else float(now)
-    now_dt = datetime.fromtimestamp(now_ts)
-
-    relative = _SNOOZE_RELATIVE_RE.fullmatch(when)
-    if relative:
-        amount = int(relative.group(1))
-        if amount <= 0:
-            raise ValueError("snooze duration must be greater than zero")
-        seconds = amount * {"m": 60, "h": 3600, "d": 86400,
-                            "w": 7 * 86400}[relative.group(2).lower()]
-        if seconds > 10 * 366 * 86400:
-            raise ValueError("snooze duration is too far in the future")
-        wake_at = now_ts + seconds
-    else:
-        match = _SNOOZE_ISO_RE.fullmatch(when)
-        named = _SNOOZE_NAMED_RE.fullmatch(when)
-        explicit_year = True
-        if match:
-            year, month, day = map(int, match.group(1, 2, 3))
-            hour = int(match.group(4)) if match.group(4) is not None else None
-            minute = int(match.group(5)) if match.group(5) is not None else None
-        elif named:
-            day = int(named.group(1))
-            month_name = named.group(2).lower()
-            month = _MONTHS.get(month_name)
-            if month is None:
-                raise ValueError("unknown month %r" % named.group(2))
-            explicit_year = named.group(3) is not None
-            year = int(named.group(3)) if explicit_year else now_dt.year
-            hour = int(named.group(4)) if named.group(4) is not None else None
-            minute = int(named.group(5)) if named.group(5) is not None else None
-        else:
-            raise ValueError("use a duration like 3h or a date like 1-oct")
-
-        if hour is None and len(words) > 1:
-            clock = _SNOOZE_CLOCK_RE.fullmatch(words[1])
-            if clock:
-                hour, minute = map(int, clock.groups())
-                rest_at = 2
-        if hour is None:
-            hour, minute = 9, 0
-        if not 0 <= hour <= 23 or not 0 <= minute <= 59:
-            raise ValueError("time must be between 00:00 and 23:59")
-        try:
-            target = datetime(year, month, day, hour, minute)
-        except ValueError as exc:
-            raise ValueError("invalid snooze date: %s" % exc)
-        if target.timestamp() <= now_ts:
-            if explicit_year:
-                raise ValueError("snooze date must be in the future")
-            try:
-                target = target.replace(year=target.year + 1)
-            except ValueError as exc:
-                raise ValueError("invalid snooze date: %s" % exc)
-        wake_at = target.timestamp()
-
-    reminder = " ".join(words[rest_at:])
-    reminder = "".join(ch for ch in reminder
-                       if ord(ch) >= 32 and not 0x7f <= ord(ch) <= 0x9f)
-    reminder = re.sub(r"\s+", " ", reminder).strip()
-    if len(reminder) > SNOOZE_MESSAGE_MAX:
-        raise ValueError("reminder is limited to %d characters" % SNOOZE_MESSAGE_MAX)
-    return wake_at, reminder
-
 
 # ---------------------------------------------------------------- titles ----
 
@@ -846,6 +789,7 @@ class InboxDaemon:
         self.cfg_mtime = self._cfg_mtime()
         self.ambiguous = set()    # (agent, cwd) pairs with >1 live pane
         self.tab_labels = {}      # tab_id -> label WE set (never clobber yours)
+        self.notices = {}         # fingerprints of one-time migration notices
         self.sum_q = queue.Queue()
         self.sum_inflight = set()  # (tid, hash) queued or running
         self.sum_failed = set()    # hashes that failed this run; don't retry
@@ -859,6 +803,7 @@ class InboxDaemon:
                 data = json.load(f)
             self.terminals = data.get("terminals", {})
             self.tab_labels = data.get("tab_labels", {}) or {}
+            self.notices = data.get("notices", {}) or {}
         except (OSError, ValueError):
             self.terminals = {}
         try:
@@ -883,7 +828,8 @@ class InboxDaemon:
         try:
             with open(tmp, "w") as f:
                 json.dump({"terminals": self.terminals,
-                           "tab_labels": self.tab_labels}, f)
+                           "tab_labels": self.tab_labels,
+                           "notices": getattr(self, "notices", {})}, f)
             os.replace(tmp, self.state_path)
         except OSError as e:
             self.log("state save failed: %s" % e)
@@ -916,6 +862,40 @@ class InboxDaemon:
             except OSError:
                 pass
             return False
+
+    def _warn_keybinding_migration(self):
+        """Show one read-only warning per relevant config shape."""
+        try:
+            with open(herdr_config_file()) as f:
+                notes = keybinding_migration_notes(f.read())
+        except OSError:
+            return
+        if not notes:
+            return
+        fingerprint = hashlib.sha256(
+            ("keybindings-v1:" + ",".join(sorted(notes))).encode()).hexdigest()
+        if self.notices.get("keybindings") == fingerprint:
+            return
+
+        bodies = []
+        if "settle" in notes:
+            bodies.append("settle/settle-workspace actions were removed; delete or rebind those commands")
+        if "prefix-e" in notes:
+            bodies.append("prefix+e archives and shadows Herdr's native scrollback; keep it if intentional, or use e inside prefix+i / bind archive to prefix+a")
+        herdr = os.environ.get("HERDR_BIN_PATH", "herdr")
+        try:
+            result = subprocess.run(
+                [herdr, "notification", "show", "Agent Inbox kept your keybindings",
+                 "--body", "; ".join(bodies) + ". No config was changed."],
+                check=False, capture_output=True, timeout=5)
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.log("keybinding migration notice failed: %s" % exc)
+            return
+        if result.returncode != 0:
+            self.log("keybinding migration notice failed (exit %d)" % result.returncode)
+            return
+        self.notices["keybindings"] = fingerprint
+        self._save()
 
     # -- inbox model --
 
@@ -1893,6 +1873,7 @@ class InboxDaemon:
     def run(self):
         self.log("daemon starting (pid %d, title_source=%s, summarize=%s)"
                  % (os.getpid(), self.cfg["title_source"], self.cfg["summarize"]))
+        self._warn_keybinding_migration()
         threading.Thread(target=self.control_loop, daemon=True).start()
         threading.Thread(target=self.events_loop, daemon=True).start()
         threading.Thread(target=self.summarize_loop, daemon=True).start()

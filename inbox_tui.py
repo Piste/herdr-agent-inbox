@@ -28,6 +28,7 @@ import time
 import unicodedata
 
 import restore
+from snooze_time import parse_snooze, snooze_feedback
 
 
 def _cwidth(ch):
@@ -729,7 +730,9 @@ def run(stdscr):
             edit_value = _wtail(snooze_text, max(1, w - len(" snooze: ") - 2))
             help_line = " snooze: %s" % edit_value
             if snooze_error:
-                header += "  (%s)" % snooze_error
+                header = " Snooze — %s" % snooze_error
+            else:
+                header, _ = snooze_feedback(snooze_text)
         if err:
             header += "  (herdr unreachable — showing stale data)"
         try:
@@ -924,6 +927,11 @@ def run(stdscr):
         ch = stdscr.getch()
         if snooze_edit:
             if ch in (10, 13):
+                try:
+                    parse_snooze(snooze_text)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    snooze_error = str(exc)
+                    continue
                 try:
                     response = control_send({"cmd": "snooze",
                                              "pane_id": snooze_row.get("pane_id"),

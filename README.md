@@ -25,10 +25,13 @@ resumable. Also includes session titles, running times, and workspace rollups fo
   session, rechecks that it did not become active, then closes its exact pane.
   Working, blocked, unknown, or transcript-less agents are refused.
 - **Snooze** — `s` accepts one Todoist-like line such as
-  `3h ask cat when back` or `1-oct tickets should be available`. The leading
-  duration/date is mandatory; the rest is an optional human-only reminder.
-  The exact session safely closes, wakes in the background without stealing
-  focus, and returns to Agents unread. Date-only snoozes wake at 09:00 local.
+  `3h ask cat when back`, `3pm`, `tom 3p ask cat`, or
+  `sep 4 3p tickets should be available`. It understands compact and natural
+  durations, clocks, weekdays, month-name dates, and common calendar phrases,
+  with a live preview or a clear parse error before you submit. The leading
+  date/time is mandatory; the rest is an optional human-only reminder. The
+  exact session safely closes, wakes in the background without stealing focus,
+  and returns to Agents unread. Date-only snoozes wake at 09:00 local.
 - **Search and revive** — `h` opens unified history with Snoozed stacked above
   Archived. `/` searches title, reminder,
   workspace, path, agent, and session ID, and Enter revives the session.
@@ -60,7 +63,7 @@ The thread you invoked it from is selected automatically.
 |---|---|
 | `enter` / double-click | Focus the agent (or reopen archived/snoozed chat) |
 | `e` / right-click | Archive an idle/done agent |
-| `s` | Snooze an idle/done agent (`15m`, `3h`, `5d`, `1-oct`, optional reminder) |
+| `s` | Snooze an idle/done agent (`3h`, `3pm`, `tom 3p`, `sep 4 3p`, optional reminder) |
 | `u` | Mark a live agent unread |
 | `h` | Snoozed + Archived history / back |
 | `/` | Search history |
@@ -83,12 +86,19 @@ Requires herdr ≥ 0.7.0 and `python3` (3.11+ recommended) on PATH.
 herdr plugin install Piste/herdr-agent-inbox
 ```
 
-The daemon starts with your session (and a watchdog revives it). Then wire up
-the display and keys:
+The daemon starts with your session (and a watchdog revives it). Installation
+does **not** rewrite your Herdr config or keybindings. It does apply the global
+Agents-pane inbox ordering (blocked → unread/done → working → idle); that sort
+already existed in the upstream plugin, minus this fork's removed settled tier.
 
-### Sidebar rows (`~/.config/herdr/config.toml`)
+Add the popup key below, then optionally merge the display tokens and direct
+actions into your own config.
 
-The plugin reports tokens; your sidebar config decides what renders:
+### Optional sidebar rows (`~/.config/herdr/config.toml`)
+
+The plugin reports tokens; your sidebar config decides what renders. The block
+below is an example layout, not a required replacement. If you already
+customized `rows`, copy only the `$…` tokens you want into that layout.
 
 ```toml
 [ui.sidebar.agents]
@@ -112,19 +122,35 @@ tokens keep the `$` prefix; builtins stay bare.
 
 ### Keybindings
 
-```toml
-[[keys.command]]
-key = "prefix+e"
-type = "shell"
-description = "archive focused idle/done agent"
-command = "herdr plugin action invoke archive --plugin herdr-agent-inbox"
+The only recommended quick-start binding is the popup. Once it is open, use
+`e` to archive, `s` to snooze, and `u` to mark unread:
 
+```toml
 [[keys.command]]
 key = "prefix+i"
 type = "shell"
 description = "open agent inbox popup"
 command = "herdr plugin pane open --plugin herdr-agent-inbox --entrypoint inbox"
+```
 
+For direct archive outside the popup, use a free key such as `prefix+a`:
+
+```toml
+[[keys.command]]
+key = "prefix+a"
+type = "shell"
+description = "archive focused idle/done agent"
+command = "herdr plugin action invoke archive --plugin herdr-agent-inbox"
+```
+
+Herdr natively uses `prefix+e` for scrollback. You can deliberately put archive
+there and move scrollback elsewhere—as the fork author does—but it is no longer
+the public default. The daemon detects that override and explains it once; it
+never changes the binding.
+
+Optional sidebar-resize bindings:
+
+```toml
 [[keys.command]]
 key = "prefix+alt+right"
 type = "shell"
@@ -139,6 +165,46 @@ command = "herdr plugin action invoke sidebar-shrink --plugin herdr-agent-inbox"
 ```
 
 Then `herdr server reload-config`.
+
+### Upgrading from the original Agent Inbox
+
+This fork does not edit old keybindings, so migration is explicit and safe:
+
+- Remove or rebind commands that invoke the deleted `settle` and
+  `settle-workspace` actions (commonly `prefix+m` and `prefix+alt+m`). They are
+  not aliases for archive: turning an old non-closing action into a pane-closing
+  action would be surprising.
+- Existing inbox and unread bindings remain valid (`prefix+i` and, in the
+  upstream example, `prefix+shift+m`).
+- Previously settled live panes simply appear as ordinary live panes because
+  the settled sort tier is gone. Upgrading does not close any pane.
+- If your config contains a removed settle action or maps archive to Herdr's
+  native `prefix+e`, the plugin shows one read-only migration note. It does not
+  rewrite the file.
+
+## Snooze language
+
+Snooze parsing is local, English, and deterministic. Supported leading
+expressions include:
+
+| Kind | Examples |
+|---|---|
+| Durations | `15m`, `1h30m`, `in 2 hours`, `+5 days`, `a month` |
+| Clocks | `3p`, `3pm`, `3 pm`, `3:30pm`, `15:30` |
+| Relative days | `today 3p`, `tom 3p`, `day after tomorrow`, `tonight` |
+| Weekdays | `fri 7pm`, `fri at 1900`, `next friday morning` |
+| Calendar dates | `sep 4 3p`, `4 sep at 15:00`, `1-oct`, `2026-09-04T15:00` |
+| Shortcuts | `next week`, `next month`, `next year`, `this weekend`, `end of month` |
+
+A bare clock uses its next occurrence, so `3p` means today before 3 PM and
+tomorrow afterward. A date without a clock means 09:00 local. `next friday`
+means the Friday after the next ordinary `friday`. Recurring expressions such
+as `every friday` are rejected with an explanation because snooze is a one-time
+wake-up.
+
+Anything left after the recognized prefix is the optional reminder: for
+example, `tom 3p ask cat when back`. The editor previews both the resolved local
+date/time and reminder as you type.
 
 ## Title configuration
 
@@ -204,6 +270,8 @@ them back to `[20, 60]`, so keyboard and mouse resize coexist. Absolute width:
 - **`inbox_tui.py`** — the popup (`[[panes]]`, placement popup) with the four
   views, mouse support, theme-matched colors, and unified history browser.
   Try it standalone with `python3 inbox_tui.py --demo`.
+- **`snooze_time.py`** — the shared, dependency-free English snooze grammar
+  and popup preview, so the UI and daemon always interpret an entry identically.
 - **`restore.py`** — exact-session revival shared by the popup and snooze
   scheduler, with explicit focus for manual revives and no focus for alarms.
 

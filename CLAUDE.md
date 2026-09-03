@@ -14,7 +14,7 @@ verify against the installed CLI (`herdr --help`, `herdr api schema --json`).
 ## Commands
 
 ```sh
-python3 -m py_compile daemon.py actions.py inbox_tui.py restore.py   # syntax gate
+python3 -m py_compile daemon.py actions.py inbox_tui.py restore.py snooze_time.py  # syntax gate
 python3 -m unittest discover -s tests -v                  # behavior tests
 python3 inbox_tui.py --demo          # run the popup standalone with canned data (no herdr needed)
 sh scripts/restart-daemon.sh         # kill + restart the daemon (verifies pid, waits for flock)
@@ -28,7 +28,7 @@ Daemon code changes only take effect after `scripts/restart-daemon.sh`.
 
 ## Architecture
 
-Three processes and one shared module follow one contract:
+Three processes and two shared modules follow one contract:
 
 - **`daemon.py`** — the only long-lived process and the only writer of state.
   Threads: `events_loop` (persistent `events.subscribe` connection; herdr
@@ -63,6 +63,10 @@ Three processes and one shared module follow one contract:
   Manual revival focuses; scheduled wake explicitly uses `--no-focus`. Both
   check for a live duplicate before opening a pane and report the exact native
   session identity immediately after launch.
+- **`snooze_time.py`** — shared, deterministic English deadline grammar and
+  display feedback. Keep parsing here so the popup preview and daemon authority
+  cannot disagree. It consumes only the leading date/time expression; the
+  remaining text is the human-only reminder.
 
 Shared conventions all three must agree on:
 
