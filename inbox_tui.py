@@ -294,7 +294,11 @@ def resume_cmd(entry):
     if agent == "pi":
         return "pi --session %s" % shlex.quote(val)
     if agent == "codex" and kind == "id":
-        return "codex resume %s" % shlex.quote(val)
+        # A plugin popup opened from another Codex pane can inherit that
+        # pane's CODEX_THREAD_ID. Codex's Herdr integration intentionally
+        # rejects a resumed session when the inherited id disagrees, so
+        # remove it for the child and let SessionStart report the resumed id.
+        return "env -u CODEX_THREAD_ID codex resume %s" % shlex.quote(val)
     return None
 
 

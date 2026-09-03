@@ -129,6 +129,13 @@ class ArchiveTests(unittest.TestCase):
 
 
 class ArchiveViewTests(unittest.TestCase):
+    def test_codex_restore_does_not_inherit_another_thread_id(self):
+        entry = {"agent": "codex", "sess_kind": "id", "sess_value": "thread-7"}
+        self.assertEqual(
+            inbox_tui.resume_cmd(entry),
+            "env -u CODEX_THREAD_ID codex resume thread-7",
+        )
+
     def test_silent_herdr_success_is_not_a_restore_failure(self):
         completed = subprocess.CompletedProcess(
             args=["herdr"], returncode=0, stdout="", stderr="")
