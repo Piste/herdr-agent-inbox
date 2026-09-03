@@ -49,7 +49,16 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(daemon.InboxDaemon.rank_for("done"), "1")
         self.assertEqual(daemon.InboxDaemon.rank_for("working"), "2")
         self.assertEqual(daemon.InboxDaemon.rank_for("idle"), "3")
+        self.assertEqual(daemon.InboxDaemon.rank_for("idle", unread=True), "1")
         self.assertEqual(daemon.InboxDaemon.rank_for("unknown"), "4")
+
+    def test_unread_is_orthogonal_to_archive(self):
+        events = []
+        obj = self.make_daemon(events)
+        response = obj.handle_command({"cmd": "unread", "pane_id": "w9:p2"})
+        self.assertTrue(response["ok"])
+        self.assertTrue(obj.terminals["term-1"]["unread"])
+        self.assertNotIn("append", events)
 
     def test_archive_is_durable_before_close(self):
         events = []

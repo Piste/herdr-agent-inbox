@@ -762,9 +762,11 @@ class InboxDaemon:
     # -- inbox model --
 
     @staticmethod
-    def rank_for(status):
+    def rank_for(status, unread=False):
         if status == "blocked":
             return RANK_BLOCKED
+        if unread:
+            return RANK_ATTENTION
         if status == "done":
             return RANK_ATTENTION
         if status == "working":
@@ -1047,6 +1049,8 @@ class InboxDaemon:
                         "first_seen": now,
                         "last_status": rec.get("agent_status"),
                         "last_change": now,
+                        "unread": False,
+                        "flagged_at": 0,
                         "title": None,
                         "title_sess": None,
                         "title_tried": 0,
@@ -1058,7 +1062,9 @@ class InboxDaemon:
                 if status != st.get("last_status"):
                     st["last_change"] = now
                     st["last_status"] = status
-                    if status not in ("working", "blocked") and self.cfg["title_source"] == "last":
+                    if status in ("working", "blocked"):
+                        st["unread"] = False
+                    elif self.cfg["title_source"] == "last":
                         # Turn ended — the latest prompt may have changed.
                         st["title_stale"] = True
                         st["title_tried"] = 0
@@ -1077,8 +1083,8 @@ class InboxDaemon:
                     or st.get("agent")
                     or "agent"
                 )
-                rank = self.rank_for(status)
-                flag = FLAG_DONE if status == "done" else ""
+                rank = self.rank_for(status, st.get("unread", False))
+                flag = FLAG_DONE if status == "done" or st.get("unread") else ""
                 tokens = {
                     "title": title,
                     "rank": rank,
@@ -1228,7 +1234,7 @@ class InboxDaemon:
             for status, st, _ in entries:
                 if status == "blocked":
                     counts["blocked"] += 1
-                elif status == "done":
+                elif status == "done" or st.get("unread"):
                     counts["attention"] += 1
                 elif status == "working":
                     counts["working"] += 1
@@ -1321,6 +1327,15 @@ class InboxDaemon:
                 if not already_saved and st.get("_last_archived") == before:
                     return {"ok": False, "error": "could not durably store archive record"}
                 self._save()
+            elif op == "unread":
+                tid = self.pane_to_tid.get(cmd.get("pane_id"))
+                st = self.terminals.get(tid)
+                if not st:
+                    return {"ok": False, "error":
+                            "no agent in pane %s" % cmd.get("pane_id")}
+                st["unread"] = True
+                st["flagged_at"] = now
+                title = st.get("title") or st.get("agent") or ""
             elif op == "set-title":
                 tid = self.pane_to_tid.get(cmd.get("pane_id"))
                 st = self.terminals.get(tid)
@@ -1364,7 +1379,13 @@ class InboxDaemon:
         return {"ok": True, "title": title}
 
     def _on_focus(self, pane_id):
-        return
+        with self.lock:
+            tid = self.pane_to_tid.get(pane_id)
+            st = self.terminals.get(tid)
+            if st and st.get("unread") \
+                    and time.time() - st.get("flagged_at", 0) > 1.5:
+                st["unread"] = False
+                self.dirty.set()
 
     # -- threads --
 

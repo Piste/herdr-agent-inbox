@@ -13,10 +13,10 @@ Also includes session titles, running times, and workspace rollups for
   conversation ("Fix flaky payment webhook tests"), not just `claude` or a
   directory name. Reads the agent's native transcript (claude / pi / codex),
   optionally summarized by any LLM command you configure.
-- **Safe archive** — `a` durably records a verifiably resumable idle/done
+- **Safe archive** — `e` durably records a verifiably resumable idle/done
   session, rechecks that it did not become active, then closes its exact pane.
   Working, blocked, unknown, or transcript-less agents are refused.
-- **Search and revive** — `u` opens the archive, `/` searches title,
+- **Search and revive** — `h` opens the archive, `/` searches title,
   workspace, path, agent, and session ID, and Enter revives the session.
   A session already live is focused instead of duplicated.
 - **Running times** — how long each session has lived and how long it's been
@@ -31,7 +31,7 @@ stdlib Python only.
 
 ## The popup
 
-`prefix+i` opens the inbox. `g` rotates four views, `u` opens the archive.
+`prefix+i` opens the inbox. `g` rotates four views, `h` opens the archive.
 
 **Compact** — one line per chat, workspace headers with a dominant-state flag:
 
@@ -44,8 +44,9 @@ stdlib Python only.
 | Key | Action |
 |---|---|
 | `enter` / double-click | Focus the agent (or reopen an archived chat) |
-| `a` / right-click | Archive an idle/done agent |
-| `u` / `h` | Archive browser / back |
+| `e` / right-click | Archive an idle/done agent |
+| `u` | Mark a live agent unread |
+| `h` | Archive browser / back |
 | `/` | Search the archive |
 | `r` | Regenerate the title |
 | `g` | Rotate view: tree → compact → grouped → flat |
@@ -96,7 +97,7 @@ tokens keep the `$` prefix; builtins stay bare.
 
 ```toml
 [[keys.command]]
-key = "prefix+m"
+key = "prefix+e"
 type = "shell"
 description = "archive focused idle/done agent"
 command = "herdr plugin action invoke archive --plugin herdr-agent-inbox"
@@ -179,7 +180,7 @@ them back to `[20, 60]`, so keyboard and mouse resize coexist. Absolute width:
   derives titles from native transcripts, and reports pane/workspace metadata
   plus an `agent.view.set` inbox sort. Archives append and fsync to
   `history.jsonl` before the pane is closed. A control socket serves the actions/TUI.
-- **`actions.py`** — the keybindable actions (archive, retitle, set-title,
+- **`actions.py`** — the keybindable actions (archive, unread, retitle, set-title,
   sidebar resize, restart-daemon).
 - **`inbox_tui.py`** — the popup (`[[panes]]`, placement popup) with the four
   views, mouse support, theme-matched colors, and searchable archive browser.

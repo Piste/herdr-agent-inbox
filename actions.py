@@ -5,7 +5,7 @@ Invoked by herdr plugin actions (see herdr-plugin.toml). Reads the invocation
 context from HERDR_PLUGIN_CONTEXT_JSON and forwards the command to the daemon's
 control socket, starting the daemon first if it isn't running.
 
-Usage: actions.py <archive|retitle> [pane_id]
+Usage: actions.py <archive|unread|retitle> [pane_id]
        actions.py sidebar <+N|-N|N>
 
 `sidebar` is herdr's missing runtime sidebar resize: herdr only sizes the
@@ -232,6 +232,8 @@ def main():
     label = resp.get("title") or ""
     if op == "archive":
         notify("Archived agent", body=label or None)
+    elif op == "unread":
+        notify("● marked unread", body=label or None)
     return 0
 
 

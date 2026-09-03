@@ -67,14 +67,14 @@ Shared conventions all three must agree on:
   Deliberately NOT `$HERDR_PLUGIN_STATE_DIR` — the daemon may be started from
   a shell without plugin env, and all entry points must resolve identical
   paths.
-- **Control protocol** ops (`archive`, `retitle`, `set-title`, `ping`)
+- **Control protocol** ops (`archive`, `unread`, `retitle`, `set-title`, `ping`)
   live in `handle_command`; the
   control thread must never die (it answers malformed input, never raises).
 - **`herdr_request` raises only `RuntimeError`/`OSError`** — callers catch
   exactly those. Don't let `ValueError` leak from JSON parsing; a herdr
   restart mid-request must never kill a thread.
-- **Rank tiers** (`rank_for`): blocked=0, done=1, working=2, idle=3,
-  unknown=4.
+- **Rank tiers** (`rank_for`): blocked=0, done/unread=1, working=2, idle=3,
+  unknown=4. Unread is a live-thread triage flag; it never closes a pane.
 - **Archiving**: verify a native session ref and idle/done status, fsync
   `history.jsonl`, recheck the same session/status, then close the exact pane.
   Never weaken this ordering. Resume commands are built only from

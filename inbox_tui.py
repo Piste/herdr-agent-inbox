@@ -5,8 +5,9 @@ An inbox over live agent panes, with a searchable archive.
 
 Keys:
   j/k, arrows   move          enter  focus agent (closes popup)
-  a             archive idle/done agent (durably, then close its pane)
-  u / h         browse archived agents
+  e             archive idle/done agent (durably, then close its pane)
+  u             mark live agent unread
+  h             browse archived agents
   /             search archive
   r             regenerate title
   g             toggle group-by-workspace
@@ -85,8 +86,8 @@ def _demo_rows():
            "Refactor zsh prompt into modules", "8m"),
         mk(5, "w4", "blog", "t4", "/Users/dev/blog", "claude", "idle", "3",
            "Write post: terminal multiplexers in 2026", "2h11m"),
-        mk(6, "w2", "api", "t2", "/Users/dev/api", "hermes", "idle", "5",
-           "Rate-limit the public endpoints", "3h40m", "⚑"),
+        mk(6, "w2", "api", "t2", "/Users/dev/api", "hermes", "idle", "3",
+           "Rate-limit the public endpoints", "3h40m"),
     ]
 
 
@@ -677,11 +678,11 @@ def run(stdscr):
             if hist_query:
                 header += " matching %r" % hist_query
             help_line = (" search: %s" % hist_query) if search_edit else \
-                " /:search  enter/dbl-click:revive  u/h:back  q:quit"
+                " /:search  enter/dbl-click:revive  h:back  q:quit"
         else:
             header = " Agent Inbox — %s" % counts_line(rows)
-            help_line = (" enter:focus  a:archive idle/done  r:retitle"
-                         "  g:view  u/h:archive  q:quit  |  right-click:archive")
+            help_line = (" enter:focus  e:archive  u:unread  r:retitle"
+                         "  g:view  h:archive  q:quit  |  right-click:archive")
         if err:
             header += "  (herdr unreachable — showing stale data)"
         try:
@@ -773,7 +774,7 @@ def run(stdscr):
                     seg(yy, x, "  (%d)" % item["count"], curses.A_DIM)
                 continue
             r = item
-            icon = STATUS_ICON.get(r["status"], "?")
+            icon = "●" if r["flag"] == "●" else STATUS_ICON.get(r["status"], "?")
             attr = curses.A_NORMAL
             if r["status"] == "blocked":
                 attr = curses.color_pair(1) | curses.A_BOLD
@@ -855,7 +856,7 @@ def run(stdscr):
             return
         if ch == -1:
             continue  # timeout -> refresh
-        if ch in (ord("h"), ord("u")):
+        if ch == ord("h"):
             hist_mode = not hist_mode
             hist_query = ""
             search_edit = False
@@ -926,11 +927,12 @@ def run(stdscr):
                 status_msg = " focus failed: %s" % e
                 continue
             return
-        elif ch in (ord("a"), ord("r")):
+        elif ch in (ord("e"), ord("a"), ord("u"), ord("r")):
             if cur_kind in ("hist", "closed"):
                 status_msg = " archived chat — enter revives it"
                 continue
-            op = {"a": "archive", "r": "retitle"}[chr(ch)]
+            op = {"e": "archive", "a": "archive",
+                  "u": "unread", "r": "retitle"}[chr(ch)]
             status_msg = send_op(op, cur)
 
 
