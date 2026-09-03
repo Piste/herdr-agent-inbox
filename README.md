@@ -32,6 +32,7 @@ stdlib Python only.
 ## The popup
 
 `prefix+i` opens the inbox. `g` rotates four views, `h` opens the archive.
+The thread you invoked it from is selected automatically.
 
 **Compact** — one line per chat, workspace headers with a dominant-state flag:
 

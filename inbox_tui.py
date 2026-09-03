@@ -151,6 +151,16 @@ def control_send(cmd):
         s.close()
 
 
+def invoking_pane_id():
+    """Pane that had focus when Herdr opened this plugin popup."""
+    try:
+        context = json.loads(os.environ.get("HERDR_PLUGIN_CONTEXT_JSON") or "{}")
+    except ValueError:
+        return None
+    pane_id = context.get("focused_pane_id")
+    return pane_id if isinstance(pane_id, str) and pane_id else None
+
+
 def load_agents():
     if DEMO:
         return _demo_rows()
@@ -293,6 +303,9 @@ def _herdr_cli(*args):
     r = subprocess.run([herdr, *args], capture_output=True, text=True)
     if r.returncode:
         return {"_error": (r.stderr or r.stdout or "herdr command failed").strip()}
+    if not r.stdout.strip():
+        # Mutating helpers such as `pane run` may succeed without a JSON body.
+        return {}
     try:
         return json.loads(r.stdout).get("result") or {}
     except ValueError:
@@ -641,7 +654,8 @@ def run(stdscr):
     hist_query = ""
     search_edit = False
     sel = 0
-    sel_key = None
+    pane_id = invoking_pane_id()
+    sel_key = ("row", pane_id) if pane_id else None
     status_msg = ""
     rows = []
 

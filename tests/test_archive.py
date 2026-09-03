@@ -1,4 +1,5 @@
 import os
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -128,6 +129,23 @@ class ArchiveTests(unittest.TestCase):
 
 
 class ArchiveViewTests(unittest.TestCase):
+    def test_silent_herdr_success_is_not_a_restore_failure(self):
+        completed = subprocess.CompletedProcess(
+            args=["herdr"], returncode=0, stdout="", stderr="")
+        with mock.patch.object(inbox_tui.subprocess, "run", return_value=completed):
+            self.assertEqual(inbox_tui._herdr_cli("pane", "run", "w1:p1", "codex"), {})
+
+    def test_popup_selects_the_invoking_thread(self):
+        with mock.patch.dict(
+                os.environ,
+                {"HERDR_PLUGIN_CONTEXT_JSON": '{"focused_pane_id":"w7:p3"}'}):
+            self.assertEqual(inbox_tui.invoking_pane_id(), "w7:p3")
+
+    def test_bad_popup_context_falls_back_cleanly(self):
+        with mock.patch.dict(
+                os.environ, {"HERDR_PLUGIN_CONTEXT_JSON": "not json"}):
+            self.assertIsNone(inbox_tui.invoking_pane_id())
+
     def test_search_matches_title_workspace_path_and_session(self):
         entries = [
             {"agent": "codex", "title": "Fix billing", "workspace": "api",
