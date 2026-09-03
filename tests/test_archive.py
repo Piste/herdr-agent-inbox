@@ -136,6 +136,20 @@ class ArchiveViewTests(unittest.TestCase):
             "env -u CODEX_THREAD_ID codex resume thread-7",
         )
 
+    def test_restore_reports_exact_session_to_herdr(self):
+        entry = {"agent": "codex", "sess_kind": "id", "sess_value": "thread-7"}
+        with mock.patch.object(inbox_tui.time, "time_ns", return_value=123), \
+                mock.patch.object(inbox_tui, "herdr_request") as request:
+            self.assertTrue(inbox_tui.report_resumed_session(entry, "w9:p4"))
+        request.assert_called_once_with("pane.report_agent_session", {
+            "pane_id": "w9:p4",
+            "source": "herdr:codex",
+            "agent": "codex",
+            "seq": 123,
+            "agent_session_id": "thread-7",
+            "session_start_source": "resume",
+        })
+
     def test_silent_herdr_success_is_not_a_restore_failure(self):
         completed = subprocess.CompletedProcess(
             args=["herdr"], returncode=0, stdout="", stderr="")

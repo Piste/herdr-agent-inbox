@@ -316,6 +316,30 @@ def _herdr_cli(*args):
         return {"_error": "invalid response from herdr"}
 
 
+def report_resumed_session(entry, pane_id):
+    """Attach the verified native session id to the newly launched pane.
+
+    Codex does not consistently fire SessionStart hooks for `resume`, so the
+    plugin reports the exact id it just launched. A later native integration
+    report uses the same source and a newer sequence, and safely supersedes it.
+    """
+    agent = entry.get("agent")
+    if agent not in ("codex", "claude") or entry.get("sess_kind") != "id":
+        return False
+    try:
+        herdr_request("pane.report_agent_session", {
+            "pane_id": pane_id,
+            "source": "herdr:%s" % agent,
+            "agent": agent,
+            "seq": time.time_ns(),
+            "agent_session_id": entry.get("sess_value"),
+            "session_start_source": "resume",
+        })
+        return True
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def do_resume(entry):
     """Reopen an archived chat: split near where it lived (or recreate its
     workspace) and launch the agent's native resume command. Returns an
@@ -366,6 +390,7 @@ def do_resume(entry):
     if result.get("_error"):
         _herdr_cli("pane", "close", new_pane)
         return "could not revive chat: %s" % result["_error"]
+    report_resumed_session(entry, new_pane)
     return None
 
 
@@ -956,6 +981,13 @@ def run(stdscr):
 
 def main():
     os.umask(0o077)  # prefs/crash-log live in the private plugin state dir
+    # ncurses otherwise waits up to ~1s to decide whether bare Escape starts
+    # an arrow/function-key sequence, which makes closing the popup feel stuck.
+    os.environ.setdefault("ESCDELAY", "25")
+    try:
+        curses.set_escdelay(25)
+    except (AttributeError, curses.error):
+        pass
     try:
         curses.wrapper(run)
     except KeyboardInterrupt:
