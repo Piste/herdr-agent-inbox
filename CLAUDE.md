@@ -6,15 +6,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A [herdr](https://herdr.dev) plugin (stdlib Python only, no dependencies) that
 turns herdr's agent sidebar into an inbox: transcript-derived session titles,
-safe archive/revive, per-agent runtimes, workspace rollups, and a searchable,
-resumable archive. Everything drives herdr through its
+safe archive/snooze/revive, per-agent runtimes, workspace rollups, and
+searchable, resumable history. Everything drives herdr through its
 public socket API and plugin manifest — never patch or assume herdr internals;
 verify against the installed CLI (`herdr --help`, `herdr api schema --json`).
 
 ## Commands
 
 ```sh
-python3 -m py_compile daemon.py actions.py inbox_tui.py   # syntax gate
+python3 -m py_compile daemon.py actions.py inbox_tui.py restore.py   # syntax gate
 python3 -m unittest discover -s tests -v                  # behavior tests
 python3 inbox_tui.py --demo          # run the popup standalone with canned data (no herdr needed)
 sh scripts/restart-daemon.sh         # kill + restart the daemon (verifies pid, waits for flock)
@@ -28,7 +28,7 @@ Daemon code changes only take effect after `scripts/restart-daemon.sh`.
 
 ## Architecture
 
-Three processes share one contract:
+Three processes and one shared module follow one contract:
 
 - **`daemon.py`** — the only long-lived process and the only writer of state.
   Threads: `events_loop` (persistent `events.subscribe` connection; herdr
@@ -52,13 +52,17 @@ Three processes share one contract:
   bounds so herdr's native mouse drag keeps working. Serialized via flock;
   never leave bounds pinned.
 - **`inbox_tui.py`** — the popup TUI (curses). Reads herdr directly for live
-  rows, `history.jsonl` for archived chats, and sends mutations through the
+  rows, `history.jsonl`/`snoozes.json` for history, and sends mutations through the
   control socket. All rendering must go through `seg()`/`_wtrunc()` (display-
   width aware — emoji are two columns; naive `len()`/`ljust` crashes curses at
   the last cell). Colors come from `_THEME_PALETTES`, extracted from herdr's
   own themes; state colors follow herdr's language (blocked=red,
   working=yellow, done-unseen=teal, idle=green). `--demo` swaps the data layer
   for fixtures — keep it working; it's how screenshots and manual tests run.
+- **`restore.py`** — shared exact-session revival used by the popup and daemon.
+  Manual revival focuses; scheduled wake explicitly uses `--no-focus`. Both
+  check for a live duplicate before opening a pane and report the exact native
+  session identity immediately after launch.
 
 Shared conventions all three must agree on:
 
@@ -67,7 +71,8 @@ Shared conventions all three must agree on:
   Deliberately NOT `$HERDR_PLUGIN_STATE_DIR` — the daemon may be started from
   a shell without plugin env, and all entry points must resolve identical
   paths.
-- **Control protocol** ops (`archive`, `unread`, `retitle`, `set-title`, `ping`)
+- **Control protocol** ops (`archive`, `snooze`, `unsnooze`, `unread`,
+  `retitle`, `set-title`, `ping`)
   live in `handle_command`; the
   control thread must never die (it answers malformed input, never raises).
 - **`herdr_request` raises only `RuntimeError`/`OSError`** — callers catch
@@ -79,6 +84,11 @@ Shared conventions all three must agree on:
   `history.jsonl`, recheck the same session/status, then close the exact pane.
   Never weaken this ordering. Resume commands are built only from
   `sess_kind`/`sess_value` via `resume_cmd()` with `shlex.quote`.
+- **Snoozing**: use the same verification/recheck/close contract as archive,
+  and fsync `snoozes.json` before close. Preserve the durable
+  `closing → pending → waking` state machine; due sessions wake in the
+  background, return unread, and carry only a human-facing reminder—never send
+  that reminder to the agent as a prompt.
 
 ## Constraints
 

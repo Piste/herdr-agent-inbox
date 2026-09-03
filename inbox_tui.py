@@ -6,9 +6,10 @@ An inbox over live agent panes, with a searchable archive.
 Keys:
   j/k, arrows   move          enter  focus agent (closes popup)
   e             archive idle/done agent (durably, then close its pane)
+  s             snooze: deadline first, optional reminder after it
   u             mark live agent unread
-  h             browse archived agents
-  /             search archive
+  h             browse snoozed and archived agents
+  /             search history
   r             regenerate title
   g             toggle group-by-workspace
   q / esc       quit
@@ -21,12 +22,12 @@ Mouse:
 import curses
 import json
 import os
-import shlex
 import socket
-import subprocess
 import sys
 import time
 import unicodedata
+
+import restore
 
 
 def _cwidth(ch):
@@ -47,6 +48,25 @@ def _wtrunc(s, cols):
         out.append(ch)
         used += cw
     return "".join(out)
+
+
+def _wtail(s, cols):
+    """Keep the rightmost display columns, for a horizontally scrolling input."""
+    out, used = [], 0
+    for ch in reversed(s):
+        width = _cwidth(ch)
+        if used + width > cols:
+            break
+        out.append(ch)
+        used += width
+    return "".join(reversed(out))
+
+
+def _timestamp(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
 
 SOURCE = "herdr-agent-inbox"
 
@@ -104,6 +124,15 @@ def _demo_history():
     ]
 
 
+def _demo_snoozes():
+    return [
+        {"agent": "codex", "title": "Buy concert tickets", "closed": time.time(),
+         "workspace_id": "w5", "workspace": "personal", "cwd": "/Users/dev",
+         "sess_kind": "id", "sess_value": "demo-snooze", "wake_at": time.time() + 3 * 3600,
+         "snooze_message": "ask cat when back", "snooze_state": "pending"},
+    ]
+
+
 def herdr_request(method, params, timeout=6.0):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(timeout)
@@ -132,7 +161,10 @@ def herdr_request(method, params, timeout=6.0):
 
 def control_send(cmd):
     if DEMO:
-        return {"ok": True, "title": "(demo)"}
+        response = {"ok": True, "title": "(demo)"}
+        if cmd.get("cmd") == "snooze":
+            response["wake_at"] = time.time() + 3600
+        return response
     # Must match daemon.py: state dir derived from the session socket.
     p = os.path.join(os.path.dirname(herdr_socket_path()), "agent-inbox-state")
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -193,6 +225,7 @@ def load_agents():
             "age": tokens.get("age") or "",
             "since": tokens.get("since") or "",
             "flag": tokens.get("flag") or "",
+            "reminder": tokens.get("reminder") or "",
             "sess_kind": (rec.get("agent_session") or {}).get("kind"),
             "sess_value": (rec.get("agent_session") or {}).get("value"),
         })
@@ -232,9 +265,7 @@ def load_history():
         return {}
 
 
-def session_key(item):
-    value = item.get("sess_value")
-    return (item.get("agent"), item.get("sess_kind"), value) if value else None
+session_key = restore.session_key
 
 
 def filter_history(entries, query):
@@ -244,14 +275,35 @@ def filter_history(entries, query):
     out = []
     for entry in entries:
         haystack = " ".join(str(entry.get(k) or "") for k in (
-            "title", "agent", "workspace", "workspace_id", "cwd", "sess_value"
+            "title", "agent", "workspace", "workspace_id", "cwd", "sess_value",
+            "snooze_message", "last_error",
         )).casefold()
         if all(word in haystack for word in words):
             out.append(entry)
     return out
 
 
-def load_hist_entries(live_rows=None):
+def load_snoozed_entries(live_rows=None):
+    """Pending/waking/failed snoozes ordered by their wake time."""
+    if DEMO:
+        return _demo_snoozes()
+    path = os.path.join(os.path.dirname(herdr_socket_path()),
+                        "agent-inbox-state", "snoozes.json")
+    try:
+        with open(path) as handle:
+            data = json.load(handle)
+        values = (data.get("snoozes") or {}).values()
+    except (OSError, ValueError, AttributeError):
+        values = []
+    live = {session_key(row) for row in (live_rows or []) if session_key(row)}
+    entries = [dict(entry) for entry in values
+               if isinstance(entry, dict) and session_key(entry) not in live]
+    entries.sort(key=lambda entry: (_timestamp(entry.get("wake_at")),
+                                    -_timestamp(entry.get("closed"))))
+    return entries
+
+
+def load_hist_entries(live_rows=None, snoozed=None):
     """Archived chats from the daemon's history.jsonl, newest first."""
     if DEMO:
         return _demo_history()
@@ -271,10 +323,12 @@ def load_hist_entries(live_rows=None):
     # A chat resumed and closed again re-archives under the same session
     # ref — keep only the newest entry per session.
     live = {session_key(r) for r in (live_rows or []) if session_key(r)}
+    snoozed_keys = {session_key(entry) for entry in (snoozed or [])
+                    if session_key(entry)}
     seen, uniq = set(), []
     for e in entries:
         key = session_key(e) or ("legacy", e.get("closed"), e.get("title"))
-        if key in live:
+        if key in live or key in snoozed_keys:
             continue
         if key in seen:
             continue
@@ -283,121 +337,43 @@ def load_hist_entries(live_rows=None):
     return uniq
 
 
-def resume_cmd(entry):
-    """Command that reopens this chat in its native CLI, or None."""
-    agent = entry.get("agent")
-    kind, val = entry.get("sess_kind"), entry.get("sess_value")
-    if not val:
-        return None
-    if agent == "claude" and kind == "id":
-        return "claude --resume %s" % shlex.quote(val)
-    if agent == "pi":
-        return "pi --session %s" % shlex.quote(val)
-    if agent == "codex" and kind == "id":
-        # A plugin popup opened from another Codex pane can inherit that
-        # pane's CODEX_THREAD_ID. Codex's Herdr integration intentionally
-        # rejects a resumed session when the inherited id disagrees, so
-        # remove it for the child and let SessionStart report the resumed id.
-        return "env -u CODEX_THREAD_ID codex resume %s" % shlex.quote(val)
-    return None
+def build_history_lines(snoozed, archived, query=""):
+    """One searchable history view, with snoozed items stacked first."""
+    snoozed = filter_history(snoozed, query)
+    archived = filter_history(archived, query)
+    lines = []
+    if snoozed:
+        lines.append(("history_header", {"label": "Snoozed",
+                                          "count": len(snoozed)}))
+        lines.extend(("snoozed", entry) for entry in snoozed)
+    if archived:
+        lines.append(("history_header", {"label": "Archived",
+                                          "count": len(archived)}))
+        lines.extend(("hist", entry) for entry in archived)
+    return lines
 
 
-def _herdr_cli(*args):
-    herdr = os.environ.get("HERDR_BIN_PATH", "herdr")
-    r = subprocess.run([herdr, *args], capture_output=True, text=True)
-    if r.returncode:
-        return {"_error": (r.stderr or r.stdout or "herdr command failed").strip()}
-    if not r.stdout.strip():
-        # Mutating helpers such as `pane run` may succeed without a JSON body.
-        return {}
-    try:
-        return json.loads(r.stdout).get("result") or {}
-    except ValueError:
-        return {"_error": "invalid response from herdr"}
-
-
-def report_resumed_session(entry, pane_id):
-    """Attach the verified native session id to the newly launched pane.
-
-    Codex does not consistently fire SessionStart hooks for `resume`, so the
-    plugin reports the exact id it just launched. A later native integration
-    report uses the same source and a newer sequence, and safely supersedes it.
-    """
-    agent = entry.get("agent")
-    if agent not in ("codex", "claude") or entry.get("sess_kind") != "id":
-        return False
-    try:
-        herdr_request("pane.report_agent_session", {
-            "pane_id": pane_id,
-            "source": "herdr:%s" % agent,
-            "agent": agent,
-            "seq": time.time_ns(),
-            "agent_session_id": entry.get("sess_value"),
-            "session_start_source": "resume",
-        })
-        return True
-    except (OSError, RuntimeError, ValueError):
-        return False
+resume_cmd = restore.resume_cmd
+_herdr_cli = restore.herdr_cli
+report_resumed_session = restore.report_resumed_session
 
 
 def do_resume(entry):
-    """Reopen an archived chat: split near where it lived (or recreate its
-    workspace) and launch the agent's native resume command. Returns an
-    error string, or None on success."""
+    """Reopen an archived/snoozed chat and focus it."""
     if DEMO:
         return "demo mode — resume disabled"
-    cmd = resume_cmd(entry)
-    if not cmd:
-        return "no resumable session ref for this chat"
-    try:
-        for rec in herdr_request("agent.list", {}).get("agents", []):
-            sess = rec.get("agent_session") or {}
-            live_key = (rec.get("agent"), sess.get("kind"), sess.get("value"))
-            if live_key == session_key(entry):
-                herdr_request("agent.focus", {"target": rec.get("pane_id")})
-                return None
-    except (OSError, RuntimeError, ValueError):
-        pass
-    new_pane = None
-    target = None
-    pane = entry.get("pane_id")
-    if pane and _herdr_cli("pane", "get", pane).get("pane"):
-        target = pane
-    if not target and entry.get("workspace_id"):
-        panes = _herdr_cli("pane", "list", "--workspace",
-                           entry["workspace_id"]).get("panes") or []
-        if panes:
-            target = panes[0].get("pane_id")
-    if target:
-        args = ["pane", "split", target, "--direction", "down", "--focus"]
-        if entry.get("cwd"):
-            args += ["--cwd", entry["cwd"]]
-        new_pane = (_herdr_cli(*args).get("pane") or {}).get("pane_id")
-    else:
-        args = ["workspace", "create", "--focus"]
-        if entry.get("cwd"):
-            args += ["--cwd", entry["cwd"]]
-        if entry.get("workspace"):
-            args += ["--label", entry["workspace"]]
-        ws = (_herdr_cli(*args).get("workspace") or {}).get("workspace_id")
-        if ws:
-            panes = _herdr_cli("pane", "list", "--workspace", ws).get("panes") or []
-            if panes:
-                new_pane = panes[0].get("pane_id")
-    if not new_pane:
-        return "could not open a pane to resume into"
-    result = _herdr_cli("pane", "run", new_pane, cmd)
-    if result.get("_error"):
-        _herdr_cli("pane", "close", new_pane)
-        return "could not revive chat: %s" % result["_error"]
-    report_resumed_session(entry, new_pane)
-    try:
-        # The split/create focus happens while this popup still owns the UI.
-        # Reassert the destination after launch so closing the popup reveals
-        # the revived conversation rather than its original invoking pane.
-        herdr_request("pane.focus", {"pane_id": new_pane})
-    except (OSError, RuntimeError, ValueError) as e:
-        return "chat revived, but could not focus it: %s" % e
+    result = restore.resume_session(entry, focus=True)
+    if not result.get("ok"):
+        return result.get("error") or "could not revive chat"
+    # A manual early revive consumes a pending snooze. If this acknowledgement
+    # is lost, the daemon also reconciles live session identities on refresh.
+    if entry.get("wake_at"):
+        try:
+            control_send({"cmd": "unsnooze", "agent": entry.get("agent"),
+                          "sess_kind": entry.get("sess_kind"),
+                          "sess_value": entry.get("sess_value")})
+        except (OSError, ValueError):
+            pass
     return None
 
 
@@ -466,7 +442,8 @@ def _sel_key_of(line):
     kind, item = line
     if kind == "row":
         return ("row", item.get("pane_id"))
-    return ("arch", item.get("sess_value") or item.get("closed"))
+    return ("snooze" if kind == "snoozed" else "arch",
+            item.get("sess_value") or item.get("closed"))
 
 
 def _agent_labels_needed(lines):
@@ -474,7 +451,7 @@ def _agent_labels_needed(lines):
     agents = {
         item.get("agent")
         for kind, item in lines
-        if kind in ("row", "hist", "closed") and item.get("agent")
+        if kind in ("row", "hist", "closed", "snoozed") and item.get("agent")
     }
     return len(agents) > 1
 
@@ -491,6 +468,12 @@ def chat_emoji(r):
     if r["status"] == "idle":
         return "🟢"
     return "⚪"
+
+
+def live_title(row):
+    reminder = row.get("reminder") or ""
+    return "%s — %s" % (row.get("title") or "", reminder) if reminder \
+        else (row.get("title") or "")
 
 
 _EMOJI_ORDER = ["🔴", "🔵", "🟡", "🟢", "⚫", "⚪"]
@@ -689,6 +672,10 @@ def run(stdscr):
     hist_mode = False
     hist_query = ""
     search_edit = False
+    snooze_edit = False
+    snooze_text = ""
+    snooze_row = None
+    snooze_error = ""
     sel = 0
     pane_id = invoking_pane_id()
     sel_key = ("row", pane_id) if pane_id else None
@@ -701,16 +688,17 @@ def run(stdscr):
             err = None
         except (OSError, RuntimeError, ValueError) as e:
             err = str(e)
-        archive = load_hist_entries(rows)
+        snoozed = load_snoozed_entries(rows)
+        archive = load_hist_entries(rows, snoozed)
         if hist_mode:
-            lines = [("hist", e) for e in filter_history(archive, hist_query)]
+            lines = build_history_lines(snoozed, archive, hist_query)
         elif mode == "tree":
             lines = build_tree(rows, [])
         else:
             lines = build_lines(rows, mode)
         show_agent = _agent_labels_needed(lines)
         row_idx = [i for i, (kind, _) in enumerate(lines)
-                   if kind in ("row", "hist", "closed")]
+                   if kind in ("row", "hist", "closed", "snoozed")]
         if row_idx:
             sel = max(0, min(sel, len(row_idx) - 1))
             # Background refreshes re-sort the list; keep the selection on
@@ -724,15 +712,24 @@ def run(stdscr):
         h, w = stdscr.getmaxyx()
         stdscr.erase()
         if hist_mode:
-            header = " Archive — %d of %d" % (len(lines), len(archive))
+            shown = sum(1 for kind, _ in lines if kind in ("hist", "snoozed"))
+            total = len(snoozed) + len(archive)
+            header = " History — %d of %d · %d snoozed · %d archived" % (
+                shown, total, len(snoozed), len(archive))
             if hist_query:
                 header += " matching %r" % hist_query
             help_line = (" search: %s" % hist_query) if search_edit else \
                 " /:search  enter/dbl-click:revive  h:back  q:quit"
         else:
             header = " Agent Inbox — %s" % counts_line(rows)
-            help_line = (" enter:focus  e:archive  u:unread  r:retitle"
-                         "  g:view  h:archive  q:quit  |  right-click:archive")
+            help_line = (" enter:focus  e:archive  s:snooze  u:unread  r:retitle"
+                         "  g:view  h:history  q:quit  |  right-click:archive")
+        edit_value = None
+        if snooze_edit:
+            edit_value = _wtail(snooze_text, max(1, w - len(" snooze: ") - 2))
+            help_line = " snooze: %s" % edit_value
+            if snooze_error:
+                header += "  (%s)" % snooze_error
         if err:
             header += "  (herdr unreachable — showing stale data)"
         try:
@@ -777,6 +774,10 @@ def run(stdscr):
         for y, i in enumerate(range(first, min(len(lines), first + visible))):
             kind, item = lines[i]
             yy = top + y
+            if kind == "history_header":
+                seg(yy, 1, "%s  (%d)" % (item["label"], item["count"]),
+                    curses.color_pair(6) | curses.A_BOLD)
+                continue
             if kind == "ws":
                 seg(yy, 1, item["workspace"], curses.color_pair(6) | curses.A_BOLD)
                 continue
@@ -785,6 +786,33 @@ def run(stdscr):
                 continue
             if kind == "pane":
                 seg(yy, item.get("x", 5), item["cwd"], curses.color_pair(5))
+                continue
+            if kind == "snoozed":
+                on = bool(row_idx and i == row_idx[sel])
+                if on:
+                    stdscr.addnstr(yy, 0, " " * (w - 1), w - 1, sel_pair)
+                state = item.get("snooze_state") or "pending"
+                wake = time.strftime("%d/%m %H:%M",
+                                     time.localtime(_timestamp(item.get("wake_at"))))
+                marker = "!" if state == "error" else "…" if state == "waking" \
+                    else "↻" if item.get("last_error") else "⏰"
+                marker_attr = curses.color_pair(1) | curses.A_BOLD \
+                    if state == "error" else curses.color_pair(2)
+                x = seg(yy, 1, marker, pick(marker_attr, on))
+                x = seg(yy, x, " " + wake + "  ", pick(curses.A_DIM, on))
+                if show_agent:
+                    x = seg(yy, x, item.get("agent", "?"),
+                            pick(curses.color_pair(4), on))
+                    x = seg(yy, x, ": ", pick(curses.A_DIM, on))
+                x = seg(yy, x, item.get("title", ""), pick(0, on))
+                if item.get("snooze_message"):
+                    x = seg(yy, x, " — " + item["snooze_message"],
+                            pick(curses.color_pair(2), on))
+                if item.get("last_error"):
+                    label = "wake failed" if state == "error" else "retrying"
+                    x = seg(yy, x, " — %s: %s" % (label, item["last_error"]),
+                            pick(curses.color_pair(1), on))
+                seg(yy, x, "  ↩", pick(curses.A_DIM, on))
                 continue
             if kind == "hist":
                 on = bool(row_idx and i == row_idx[sel])
@@ -841,7 +869,8 @@ def run(stdscr):
                     x = seg(yy, x, r["agent"],
                             pick(curses.color_pair(4), selected))
                     x = seg(yy, x, ": ", pick(curses.A_DIM, selected))
-                x = seg(yy, x, r["title"][: max(10, w - x - 8)], pick(attr, selected))
+                x = seg(yy, x, live_title(r)[: max(10, w - x - 8)],
+                        pick(attr, selected))
                 x = seg(yy, x, " — ", pick(curses.A_DIM, selected))
                 seg(yy, x, chat_emoji(r), pick(0, selected))
                 continue
@@ -850,7 +879,7 @@ def run(stdscr):
                 if selected:
                     stdscr.addnstr(yy, 0, " " * (w - 1), w - 1, sel_pair)
                 agent_space = len(r["agent"]) + 3 if show_agent else 0
-                title = r["title"][: max(10, w - agent_space - 12)]
+                title = live_title(r)[: max(10, w - agent_space - 12)]
                 x = seg(yy, 4, title, pick(attr, selected))
                 if show_agent:
                     x = seg(yy, x, " — ", pick(curses.A_DIM, selected))
@@ -863,15 +892,18 @@ def run(stdscr):
                         if show_agent else "%s · %s" % (r["workspace"], r["age"]))
             indent = "   " if mode == "grouped" else " "
             avail = max(10, w - len(meta) - len(indent) - 7)
-            text = "%s%s %-*s  %s" % (indent, icon, avail, r["title"][:avail], meta)
+            text = "%s%s %-*s  %s" % (indent, icon, avail,
+                                        live_title(r)[:avail], meta)
             attr = pick(attr, selected)
             stdscr.addnstr(top + y, 0, text.ljust(w - 1), w - 1, attr)
         stdscr.refresh()
         status_msg = ""
-        if search_edit:
+        if search_edit or snooze_edit:
             try:
                 curses.curs_set(1)
-                stdscr.move(h - 1, min(w - 2, len(" search: ") + _wwidth(hist_query)))
+                prefix = " search: " if search_edit else " snooze: "
+                value = hist_query if search_edit else edit_value
+                stdscr.move(h - 1, min(w - 2, len(prefix) + _wwidth(value)))
             except curses.error:
                 pass
         else:
@@ -890,6 +922,38 @@ def run(stdscr):
                 return " daemon not reachable: %s" % e
 
         ch = stdscr.getch()
+        if snooze_edit:
+            if ch in (10, 13):
+                try:
+                    response = control_send({"cmd": "snooze",
+                                             "pane_id": snooze_row.get("pane_id"),
+                                             "spec": snooze_text})
+                except (OSError, ValueError) as exc:
+                    response = {"ok": False, "error": "daemon not reachable: %s" % exc}
+                if response.get("ok"):
+                    wake = time.strftime("%d/%m %H:%M",
+                                         time.localtime(_timestamp(response.get("wake_at"))))
+                    status_msg = " snoozed until %s: %s" % (
+                        wake, snooze_row.get("title") or "agent")
+                    snooze_edit = False
+                    snooze_text = ""
+                    snooze_row = None
+                    snooze_error = ""
+                    sel_key = None
+                else:
+                    snooze_error = str(response.get("error") or "snooze failed")
+            elif ch == 27:
+                snooze_edit = False
+                snooze_text = ""
+                snooze_row = None
+                snooze_error = ""
+            elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                snooze_text = snooze_text[:-1]
+                snooze_error = ""
+            elif 32 <= ch <= 0x10ffff:
+                snooze_text += chr(ch)
+                snooze_error = ""
+            continue
         if search_edit:
             if ch in (10, 13):
                 search_edit = False
@@ -910,6 +974,7 @@ def run(stdscr):
             hist_mode = not hist_mode
             hist_query = ""
             search_edit = False
+            snooze_edit = False
             sel = 0
             sel_key = None
             continue
@@ -930,13 +995,13 @@ def run(stdscr):
             i = first + (my - top)
             if not (0 <= my - top < visible and 0 <= i < len(lines)):
                 continue
-            if lines[i][0] not in ("row", "hist", "closed"):
+            if lines[i][0] not in ("row", "hist", "closed", "snoozed"):
                 continue
             row = lines[i][1]
             if i in row_idx:
                 sel = row_idx.index(i)
                 sel_key = _sel_key_of(lines[i])
-            if lines[i][0] in ("hist", "closed"):
+            if lines[i][0] in ("hist", "closed", "snoozed"):
                 if bstate & curses.BUTTON1_DOUBLE_CLICKED:
                     err = do_resume(row)
                     if err:
@@ -965,7 +1030,7 @@ def run(stdscr):
             sel = max(sel - 1, 0)
             sel_key = _sel_key_of(lines[row_idx[sel]])
         elif ch == 10:  # enter
-            if cur_kind in ("hist", "closed"):
+            if cur_kind in ("hist", "closed", "snoozed"):
                 err = do_resume(cur)
                 if err:
                     status_msg = " " + err
@@ -977,8 +1042,16 @@ def run(stdscr):
                 status_msg = " focus failed: %s" % e
                 continue
             return
+        elif ch == ord("s"):
+            if cur_kind != "row":
+                status_msg = " snooze applies to a live agent"
+                continue
+            snooze_edit = True
+            snooze_text = ""
+            snooze_row = dict(cur)
+            snooze_error = ""
         elif ch in (ord("e"), ord("a"), ord("u"), ord("r")):
-            if cur_kind in ("hist", "closed"):
+            if cur_kind in ("hist", "closed", "snoozed"):
                 status_msg = " archived chat — enter revives it"
                 continue
             op = {"e": "archive", "a": "archive",

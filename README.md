@@ -1,8 +1,8 @@
 # herdr-agent-inbox
 
 **An actual inbox for your coding agents.** Live agents stay in the Agents
-pane; archived agents disappear from it but remain searchable and resumable.
-Also includes session titles, running times, and workspace rollups for
+pane; archived and snoozed agents disappear but remain searchable and
+resumable. Also includes session titles, running times, and workspace rollups for
 [herdr](https://herdr.dev).
 
 ![Tree view — workspaces, directories, chats with live state and archived history](assets/tree.png)
@@ -16,7 +16,13 @@ Also includes session titles, running times, and workspace rollups for
 - **Safe archive** — `e` durably records a verifiably resumable idle/done
   session, rechecks that it did not become active, then closes its exact pane.
   Working, blocked, unknown, or transcript-less agents are refused.
-- **Search and revive** — `h` opens the archive, `/` searches title,
+- **Snooze** — `s` accepts one Todoist-like line such as
+  `3h ask cat when back` or `1-oct tickets should be available`. The leading
+  duration/date is mandatory; the rest is an optional human-only reminder.
+  The exact session safely closes, wakes in the background without stealing
+  focus, and returns to Agents unread. Date-only snoozes wake at 09:00 local.
+- **Search and revive** — `h` opens unified history with Snoozed stacked above
+  Archived. `/` searches title, reminder,
   workspace, path, agent, and session ID, and Enter revives the session.
   A session already live is focused instead of duplicated.
 - **Running times** — how long each session has lived and how long it's been
@@ -31,24 +37,25 @@ stdlib Python only.
 
 ## The popup
 
-`prefix+i` opens the inbox. `g` rotates four views, `h` opens the archive.
+`prefix+i` opens the inbox. `g` rotates four views, `h` opens history.
 The thread you invoked it from is selected automatically.
 
 **Compact** — one line per chat, workspace headers with a dominant-state flag:
 
 ![Compact view](assets/compact.png)
 
-**Archive** — every archived chat, newest first; `↩` means resumable:
+**History** — snoozed chats first, then every archived chat; `↩` means resumable:
 
 ![History browser](assets/history.png)
 
 | Key | Action |
 |---|---|
-| `enter` / double-click | Focus the agent (or reopen an archived chat) |
+| `enter` / double-click | Focus the agent (or reopen archived/snoozed chat) |
 | `e` / right-click | Archive an idle/done agent |
+| `s` | Snooze an idle/done agent (`15m`, `3h`, `5d`, `1-oct`, optional reminder) |
 | `u` | Mark a live agent unread |
-| `h` | Archive browser / back |
-| `/` | Search the archive |
+| `h` | Snoozed + Archived history / back |
+| `/` | Search history |
 | `r` | Regenerate the title |
 | `g` | Rotate view: tree → compact → grouped → flat |
 | `q` / esc | Close |
@@ -56,7 +63,7 @@ The thread you invoked it from is selected automatically.
 ### State legend
 
 `🔴` / `!` blocked · `🔵` / `●` finished, unseen · `🟡` / `▸` working ·
-`🟢` / `○` idle · `⚫` archived chat — matching herdr's
+`🟢` / `○` idle · `⏰` snoozed · `⚫` archived chat — matching herdr's
 own sidebar color language (red/teal/yellow/green), in your herdr theme's
 exact palette.
 
@@ -79,7 +86,7 @@ The plugin reports tokens; your sidebar config decides what renders:
 [ui.sidebar.agents]
 rows = [
   ["state_icon", "$title"],
-  [{ token = "$flag", fg = "#f1fa8c", bold = true }, "agent", "workspace", { token = "$age", dim = true }],
+  [{ token = "$reminder", bold = true }, { token = "$flag", fg = "#f1fa8c", bold = true }, "agent", "workspace", { token = "$age", dim = true }],
 ]
 
 [ui.sidebar.spaces]
@@ -90,7 +97,8 @@ rows = [
 ```
 
 Available pane tokens: `$title`, `$age` (session running time), `$since`
-(time in current state), `$flag` (● finished-unseen). Workspace tokens:
+(time in current state), `$flag` (● finished-unseen), and `$reminder` (a
+woken snooze's human reminder, cleared when focused). Workspace tokens:
 `$agents` (state counts), `$busy` (longest working stint). Styled custom
 tokens keep the `$` prefix; builtins stay bare.
 
@@ -160,8 +168,9 @@ without transcript refs (e.g. hermes) fall back to their pane/terminal title
 — which you can override anytime: the inbox's `r` regenerates, and the
 `set-title` control command pins a title of your choosing.
 
-**Privacy note:** titles are derived from your prompts. They are stored
-locally (plugin state dir) and rendered in your sidebar. If you enable
+**Privacy note:** titles are derived from your prompts, and snooze reminders
+are the text you type. Both are stored locally in the private plugin state
+directory and may be rendered in your sidebar/Herdr notifications. If you enable
 `summarize`, prompt excerpts are piped to *whatever command you configure* —
 nothing leaves your machine unless that command sends it somewhere.
 
@@ -180,15 +189,18 @@ them back to `[20, 60]`, so keyboard and mouse resize coexist. Absolute width:
   `[[startup]]` hook. Subscribes to herdr socket events, diffs `agent.list`,
   derives titles from native transcripts, and reports pane/workspace metadata
   plus an `agent.view.set` inbox sort. Archives append and fsync to
-  `history.jsonl` before the pane is closed. A control socket serves the actions/TUI.
+  `history.jsonl`; snoozes atomically fsync their wake queue before the pane is
+  closed. A control socket serves the actions/TUI.
 - **`actions.py`** — the keybindable actions (archive, unread, retitle, set-title,
   sidebar resize, restart-daemon).
 - **`inbox_tui.py`** — the popup (`[[panes]]`, placement popup) with the four
-  views, mouse support, theme-matched colors, and searchable archive browser.
+  views, mouse support, theme-matched colors, and unified history browser.
   Try it standalone with `python3 inbox_tui.py --demo`.
+- **`restore.py`** — exact-session revival shared by the popup and snooze
+  scheduler, with explicit focus for manual revives and no focus for alarms.
 
 State lives next to your herdr session socket in `agent-inbox-state/`
-(`state.json`, `history.jsonl`, `daemon.log`, control socket).
+(`state.json`, `history.jsonl`, `snoozes.json`, `daemon.log`, control socket).
 
 ## License
 

@@ -11,9 +11,10 @@ Watches herdr's agent panes and decorates them with inbox metadata:
 - workspace tokens `agents` (per-status counts, e.g. "!1 ▸2 ✓1 ⚑1") and
   `busy` (longest currently-working stint).
 
-Archive commands arrive on a control socket (see actions.py). Archiving is a
-durable-record-before-close operation and is only allowed for verifiably
-resumable idle/done sessions.
+Archive and snooze commands arrive on a control socket (see actions.py).
+Both use a durable-record-before-close operation and are only allowed for
+verifiably resumable idle/done sessions. Due snoozes resume in the background,
+without focus, and return as unread human reminders.
 State persists across herdr server restarts keyed by terminal_id.
 
 Stdlib only. One herdr request per connection (the server closes the socket
@@ -32,6 +33,9 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
+
+import restore
 
 try:
     import tomllib
@@ -50,6 +54,7 @@ RANK_WORKING = "2"
 RANK_IDLE = "3"
 RANK_UNKNOWN = "4"
 FLAG_DONE = "●"
+SNOOZE_MESSAGE_MAX = 240
 
 # Agents whose native title we can only find by working directory (herdr
 # reports no session ref for them, or they never publish the title). Two live
@@ -257,6 +262,112 @@ def fmt_dur(secs):
         return "%dh%02dm" % (h, m) if m else "%dh" % h
     d, h = divmod(secs // 3600, 24)
     return "%dd%dh" % (d, h) if h else "%dd" % d
+
+
+_SNOOZE_RELATIVE_RE = re.compile(r"^(\d+)([mhdw])$", re.I)
+_SNOOZE_ISO_RE = re.compile(
+    r"^(\d{4})-(\d{1,2})-(\d{1,2})(?:[T@](\d{1,2}):(\d{2}))?$", re.I)
+_SNOOZE_NAMED_RE = re.compile(
+    r"^(\d{1,2})-([a-z]{3,9})(?:-(\d{4}))?(?:[T@](\d{1,2}):(\d{2}))?$", re.I)
+_SNOOZE_CLOCK_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
+_MONTHS = {
+    name: number
+    for number, names in enumerate((
+        (), ("jan", "january"), ("feb", "february"),
+        ("mar", "march"), ("apr", "april"), ("may",),
+        ("jun", "june"), ("jul", "july"), ("aug", "august"),
+        ("sep", "sept", "september"), ("oct", "october"),
+        ("nov", "november"), ("dec", "december"),
+    ))
+    for name in names
+}
+
+
+def _safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def parse_snooze_spec(text, now=None):
+    """Parse ``<when> [reminder]`` into (wake timestamp, reminder).
+
+    Supported deadlines are relative ``15m``/``3h``/``5d``/``2w`` values,
+    ISO dates, and human dates such as ``1-oct``. A separate ``HH:MM`` token
+    or ``@HH:MM`` suffix overrides the 09:00 date-only default. Everything
+    after the deadline is a reminder for the human; it is never sent to the
+    resumed agent.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        raise ValueError("enter a duration or date, e.g. 3h or 1-oct")
+    words = raw.split()
+    when = words[0]
+    rest_at = 1
+    now_ts = time.time() if now is None else float(now)
+    now_dt = datetime.fromtimestamp(now_ts)
+
+    relative = _SNOOZE_RELATIVE_RE.fullmatch(when)
+    if relative:
+        amount = int(relative.group(1))
+        if amount <= 0:
+            raise ValueError("snooze duration must be greater than zero")
+        seconds = amount * {"m": 60, "h": 3600, "d": 86400,
+                            "w": 7 * 86400}[relative.group(2).lower()]
+        if seconds > 10 * 366 * 86400:
+            raise ValueError("snooze duration is too far in the future")
+        wake_at = now_ts + seconds
+    else:
+        match = _SNOOZE_ISO_RE.fullmatch(when)
+        named = _SNOOZE_NAMED_RE.fullmatch(when)
+        explicit_year = True
+        if match:
+            year, month, day = map(int, match.group(1, 2, 3))
+            hour = int(match.group(4)) if match.group(4) is not None else None
+            minute = int(match.group(5)) if match.group(5) is not None else None
+        elif named:
+            day = int(named.group(1))
+            month_name = named.group(2).lower()
+            month = _MONTHS.get(month_name)
+            if month is None:
+                raise ValueError("unknown month %r" % named.group(2))
+            explicit_year = named.group(3) is not None
+            year = int(named.group(3)) if explicit_year else now_dt.year
+            hour = int(named.group(4)) if named.group(4) is not None else None
+            minute = int(named.group(5)) if named.group(5) is not None else None
+        else:
+            raise ValueError("use a duration like 3h or a date like 1-oct")
+
+        if hour is None and len(words) > 1:
+            clock = _SNOOZE_CLOCK_RE.fullmatch(words[1])
+            if clock:
+                hour, minute = map(int, clock.groups())
+                rest_at = 2
+        if hour is None:
+            hour, minute = 9, 0
+        if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+            raise ValueError("time must be between 00:00 and 23:59")
+        try:
+            target = datetime(year, month, day, hour, minute)
+        except ValueError as exc:
+            raise ValueError("invalid snooze date: %s" % exc)
+        if target.timestamp() <= now_ts:
+            if explicit_year:
+                raise ValueError("snooze date must be in the future")
+            try:
+                target = target.replace(year=target.year + 1)
+            except ValueError as exc:
+                raise ValueError("invalid snooze date: %s" % exc)
+        wake_at = target.timestamp()
+
+    reminder = " ".join(words[rest_at:])
+    reminder = "".join(ch for ch in reminder
+                       if ord(ch) >= 32 and not 0x7f <= ord(ch) <= 0x9f)
+    reminder = re.sub(r"\s+", " ", reminder).strip()
+    if len(reminder) > SNOOZE_MESSAGE_MAX:
+        raise ValueError("reminder is limited to %d characters" % SNOOZE_MESSAGE_MAX)
+    return wake_at, reminder
 
 
 # ---------------------------------------------------------------- titles ----
@@ -721,11 +832,13 @@ class InboxDaemon:
         self.dir = state_dir()
         self.log = Log(os.path.join(self.dir, "daemon.log"))
         self.state_path = os.path.join(self.dir, "state.json")
+        self.snooze_path = os.path.join(self.dir, "snoozes.json")
         self.control_path = os.path.join(self.dir, "control.sock")
         self.lock = threading.RLock()
         self.dirty = threading.Event()
         self.stop = threading.Event()
         self.terminals = {}       # terminal_id -> persisted per-agent state
+        self.snoozes = {}         # exact session key -> pending/waking snooze
         self.last_report = {}     # terminal_id -> {"title":..., "tokens": {...}}
         self.ws_report = {}       # workspace_id -> tokens dict last reported
         self.pane_to_tid = {}     # pane_id -> terminal_id (from last refresh)
@@ -748,6 +861,22 @@ class InboxDaemon:
             self.tab_labels = data.get("tab_labels", {}) or {}
         except (OSError, ValueError):
             self.terminals = {}
+        try:
+            with open(self.snooze_path) as f:
+                snooze_data = json.load(f)
+            snoozes = snooze_data.get("snoozes", {})
+            if not isinstance(snoozes, dict):
+                raise ValueError("snoozes must be an object")
+            self.snoozes = {
+                str(key): entry for key, entry in snoozes.items()
+                if isinstance(entry, dict)
+                and entry.get("agent")
+                and entry.get("sess_kind") in ("id", "path")
+                and entry.get("sess_value")
+                and _safe_float(entry.get("wake_at")) > 0
+            }
+        except (OSError, ValueError):
+            self.snoozes = {}
 
     def _save(self):
         tmp = self.state_path + ".tmp"
@@ -758,6 +887,35 @@ class InboxDaemon:
             os.replace(tmp, self.state_path)
         except OSError as e:
             self.log("state save failed: %s" % e)
+
+    def _save_snoozes(self):
+        """Atomically and durably persist the wake queue before pane close."""
+        tmp = self.snooze_path + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump({"version": 1, "snoozes": self.snoozes}, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self.snooze_path)
+            try:
+                directory = os.open(self.dir, os.O_RDONLY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+            except OSError:
+                # Some filesystems reject directory fsync; the file itself is
+                # still flushed and atomically installed.
+                pass
+            return True
+        except OSError as exc:
+            self.log("snooze save failed: %s" % exc)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return False
 
     # -- inbox model --
 
@@ -810,6 +968,24 @@ class InboxDaemon:
                     st["sum_hash"] = None
             self.sum_failed.clear()
 
+    @staticmethod
+    def _history_entry(st, now, reason):
+        if not st.get("title"):
+            return None
+        return {
+            "agent": st.get("agent"),
+            "title": st["title"],
+            "closed": now,
+            "first_seen": st.get("first_seen"),
+            "workspace_id": st.get("ws"),
+            "workspace": st.get("ws_label"),
+            "pane_id": st.get("pane_id"),
+            "cwd": st.get("cwd"),
+            "sess_kind": st.get("sess_kind"),
+            "sess_value": st.get("sess_value"),
+            "reason": reason,
+        }
+
     def _archive_chat(self, st, now, reason="closed"):
         """Archive st's current chat: into its in-pane history (capped 10,
         drives the tree's ⚫ rows) and the durable history.jsonl (drives the
@@ -820,20 +996,8 @@ class InboxDaemon:
         fingerprint = (st.get("sess_ref"), st.get("title"))
         if fingerprint == tuple(st.get("_last_archived") or ()):
             return hist
-        if st.get("title"):
-            entry = {
-                "agent": st.get("agent"),
-                "title": st["title"],
-                "closed": now,
-                "first_seen": st.get("first_seen"),
-                "workspace_id": st.get("ws"),
-                "workspace": st.get("ws_label"),
-                "pane_id": st.get("pane_id"),
-                "cwd": st.get("cwd"),
-                "sess_kind": st.get("sess_kind"),
-                "sess_value": st.get("sess_value"),
-                "reason": reason,
-            }
+        entry = self._history_entry(st, now, reason)
+        if entry:
             if self._append_history(entry):
                 st["_last_archived"] = list(fingerprint)
                 hist.append({"agent": entry["agent"], "title": entry["title"],
@@ -865,6 +1029,16 @@ class InboxDaemon:
         sess = rec.get("agent_session") or {}
         value = sess.get("value")
         return (rec.get("agent"), sess.get("kind"), value) if value else None
+
+    @staticmethod
+    def _entry_session_key(entry):
+        value = entry.get("sess_value")
+        return (entry.get("agent"), entry.get("sess_kind"), value) if value else None
+
+    @staticmethod
+    def _snooze_key(session_key):
+        return json.dumps(list(session_key), ensure_ascii=False,
+                          separators=(",", ":"))
 
     def _resume_error(self, rec):
         """Return None only when this exact native session can be resumed."""
@@ -1064,6 +1238,8 @@ class InboxDaemon:
                     st["last_status"] = status
                     if status in ("working", "blocked"):
                         st["unread"] = False
+                        st["unread_origin"] = None
+                        st["reminder"] = ""
                     elif self.cfg["title_source"] == "last":
                         # Turn ended — the latest prompt may have changed.
                         st["title_stale"] = True
@@ -1091,6 +1267,8 @@ class InboxDaemon:
                     "age": fmt_dur(now - st["first_seen"]),
                     "since": fmt_dur(now - st["last_change"]),
                     "flag": flag,
+                    "reminder": ("⏰ " + st["reminder"])
+                    if st.get("reminder") else "",
                 }
                 pending.append(self._pane_report_item(pane_id, tid, st, tokens))
 
@@ -1122,6 +1300,7 @@ class InboxDaemon:
             titles = {t: v[1] for t, v in tab_best.items()}
             for tab_id, label in self._tab_rename_items(titles):
                 self._send_tab_rename(tab_id, label)
+        self._process_snoozes(agents, now)
 
     def _pane_report_item(self, pane_id, tid, st, tokens):
         meta_title = st.get("title")  # only override the pane title if generated
@@ -1268,6 +1447,143 @@ class InboxDaemon:
             items.append((ws, {"agents": None, "busy": None}))
         return items
 
+    def _notify_snooze_wake(self, entry, failed=False):
+        herdr = os.environ.get("HERDR_BIN_PATH", "herdr")
+        title = ("Snooze wake failed: %s" % (entry.get("title") or "agent")) \
+            if failed else "⏰ %s" % (entry.get("title") or "Snoozed thread")
+        body = entry.get("last_error") if failed else (
+            entry.get("snooze_message") or "Snoozed thread is back")
+        args = [herdr, "notification", "show", title]
+        if body:
+            args += ["--body", str(body)]
+        args += ["--sound", "request" if failed else "done"]
+        try:
+            subprocess.run(args, check=False, capture_output=True)
+        except OSError as exc:
+            self.log("snooze notification failed: %s" % exc)
+
+    def _process_snoozes(self, agents, now):
+        """Reconcile manual revives and launch due snoozes without focus."""
+        live_by_key = {self._session_key(rec): rec for rec in agents
+                       if self._session_key(rec)}
+        live_by_pane = {rec.get("pane_id"): rec for rec in agents
+                        if rec.get("pane_id")}
+        due = []
+        notifications = []
+        failed_notifications = []
+        changed = False
+        with self.lock:
+            before = {key: dict(entry) for key, entry in self.snoozes.items()}
+            for key, entry in list(self.snoozes.items()):
+                state = entry.get("snooze_state") or "pending"
+                rec = live_by_key.get(self._entry_session_key(entry))
+                if rec is None and state == "waking":
+                    rec = live_by_pane.get(entry.get("wake_pane_id"))
+                if state == "closing":
+                    if rec is not None:
+                        # The control thread durably records before closing.
+                        # Give that close time to land; if it did not, cancel
+                        # rather than later duplicating a still-live session.
+                        if now - _safe_float(entry.get("snoozed_at"), now) > 10:
+                            del self.snoozes[key]
+                            changed = True
+                        continue
+                    entry["snooze_state"] = "pending"
+                    state = "pending"
+                    changed = True
+                if rec is not None:
+                    # A pending/error snooze appearing live was revived by the
+                    # user before its alarm. Consume it without manufacturing
+                    # unread attention. A daemon-launched wake becomes unread
+                    # only once the resumed agent is safely idle/done.
+                    if state == "waking" and rec.get("agent_status") \
+                            not in ("idle", "done"):
+                        continue
+                    if state == "waking":
+                        tid = rec.get("terminal_id")
+                        st = self.terminals.get(tid)
+                        if st is None:
+                            continue
+                        st["unread"] = True
+                        st["unread_origin"] = "snooze"
+                        st["flagged_at"] = now
+                        st["reminder"] = entry.get("snooze_message") or ""
+                        st["reminder_woke_at"] = now
+                        notifications.append(dict(entry))
+                    del self.snoozes[key]
+                    changed = True
+                    continue
+                due_at = max(_safe_float(entry.get("wake_at")),
+                             _safe_float(entry.get("retry_at")))
+                if state == "pending" and due_at <= now:
+                    entry["snooze_state"] = "waking"
+                    entry["wake_started_at"] = now
+                    entry.pop("last_error", None)
+                    due.append((key, dict(entry)))
+                    changed = True
+                elif state == "waking" and not entry.get("wake_pane_id") \
+                        and now - _safe_float(entry.get("wake_started_at"), now) > 60:
+                    entry["snooze_state"] = "error"
+                    entry["last_error"] = "wake was interrupted before a pane opened"
+                    failed_notifications.append(dict(entry))
+                    changed = True
+                elif state == "waking" and entry.get("wake_pane_id") \
+                        and now - _safe_float(entry.get("wake_launched_at"), now) > 120:
+                    entry["snooze_state"] = "error"
+                    entry["last_error"] = "resumed pane did not become a ready agent"
+                    failed_notifications.append(dict(entry))
+                    changed = True
+            if changed:
+                if not self._save_snoozes():
+                    self.snoozes = before
+                    due = []
+                    notifications = []
+                    failed_notifications = []
+                else:
+                    self._save()
+
+        for entry in notifications:
+            self._notify_snooze_wake(entry)
+        for entry in failed_notifications:
+            self._notify_snooze_wake(entry, failed=True)
+
+        for key, entry in due:
+            result = restore.resume_session(entry, focus=False)
+            failed_entry = None
+            with self.lock:
+                current = self.snoozes.get(key)
+                if current is None or current.get("snooze_state") != "waking":
+                    continue
+                if result.get("ok"):
+                    current["wake_pane_id"] = result.get("pane_id")
+                    current["wake_launched_at"] = time.time()
+                    current.pop("retry_at", None)
+                else:
+                    attempts = int(current.get("wake_attempts") or 0) + 1
+                    current["wake_attempts"] = attempts
+                    current["last_error"] = result.get("error") or "unknown wake failure"
+                    if attempts < 5:
+                        current["snooze_state"] = "pending"
+                        current["retry_at"] = time.time() + min(300, 30 * (2 ** (attempts - 1)))
+                    else:
+                        current["snooze_state"] = "error"
+                        failed_entry = dict(current)
+                self._save_snoozes()
+            if failed_entry:
+                self._notify_snooze_wake(failed_entry, failed=True)
+            self.dirty.set()
+
+    def _next_wake_delay(self):
+        now = time.time()
+        with self.lock:
+            deadlines = [max(_safe_float(entry.get("wake_at")),
+                             _safe_float(entry.get("retry_at")))
+                         for entry in self.snoozes.values()
+                         if (entry.get("snooze_state") or "pending") == "pending"]
+        if not deadlines:
+            return TICK_SECS
+        return max(0.05, min(TICK_SECS, min(deadlines) - now))
+
     def _prune(self, seen_tids, now):
         for tid, st in list(self.terminals.items()):
             if tid in seen_tids:
@@ -1291,7 +1607,28 @@ class InboxDaemon:
         op = cmd.get("cmd")
         now = time.time()
         agents = None
-        if op == "archive":
+        wake_at = None
+        reminder = ""
+        snooze_key = None
+        if op == "unsnooze":
+            session_key = (cmd.get("agent"), cmd.get("sess_kind"),
+                           cmd.get("sess_value"))
+            if not all(session_key):
+                return {"ok": False, "error": "missing snoozed session reference"}
+            key = self._snooze_key(session_key)
+            with self.lock:
+                previous = self.snoozes.pop(key, None)
+                if previous is not None and not self._save_snoozes():
+                    self.snoozes[key] = previous
+                    return {"ok": False, "error": "could not persist unsnooze"}
+            self.dirty.set()
+            return {"ok": True, "removed": previous is not None}
+        if op == "snooze":
+            try:
+                wake_at, reminder = parse_snooze_spec(cmd.get("spec"), now)
+            except ValueError as exc:
+                return {"ok": False, "error": str(exc)}
+        if op in ("archive", "snooze"):
             try:
                 agents = herdr_request("agent.list", {}).get("agents", [])
             except (OSError, RuntimeError) as e:
@@ -1303,13 +1640,14 @@ class InboxDaemon:
             status = rec.get("agent_status") or "unknown"
             if status not in ("idle", "done"):
                 return {"ok": False, "error":
-                        "archive requires an idle or done agent (currently %s)" % status}
+                        "%s requires an idle or done agent (currently %s)"
+                        % (op, status)}
             err = self._resume_error(rec)
             if err:
                 return {"ok": False, "error": err}
             original_key = self._session_key(rec)
         with self.lock:
-            if op == "archive":
+            if op in ("archive", "snooze"):
                 tid = self.pane_to_tid.get(pane_id)
                 if not tid or tid not in self.terminals:
                     return {"ok": False, "error": "agent metadata is not ready; try again"}
@@ -1320,12 +1658,51 @@ class InboxDaemon:
                     return {"ok": False, "error":
                             "agent metadata changed; wait for inbox refresh and retry"}
                 title = st.get("title") or st.get("agent") or ""
-                fingerprint = (st.get("sess_ref"), st.get("title"))
-                already_saved = fingerprint == tuple(st.get("_last_archived") or ())
-                before = st.get("_last_archived")
-                st["history"] = self._archive_chat(st, now, "archived")
-                if not already_saved and st.get("_last_archived") == before:
-                    return {"ok": False, "error": "could not durably store archive record"}
+                if op == "archive":
+                    existing_snooze_key = self._snooze_key(original_key)
+                    existing_snooze = self.snoozes.pop(existing_snooze_key, None)
+                    if existing_snooze is not None and not self._save_snoozes():
+                        self.snoozes[existing_snooze_key] = existing_snooze
+                        return {"ok": False, "error":
+                                "could not durably cancel the existing snooze"}
+                    fingerprint = (st.get("sess_ref"), st.get("title"))
+                    already_saved = fingerprint == tuple(st.get("_last_archived") or ())
+                    before = st.get("_last_archived")
+                    st["history"] = self._archive_chat(st, now, "archived")
+                    if not already_saved and st.get("_last_archived") == before:
+                        return {"ok": False, "error":
+                                "could not durably store archive record"}
+                else:
+                    entry = self._history_entry(st, now, "snoozed")
+                    if entry is None:
+                        return {"ok": False, "error": "agent title is not ready; try again"}
+                    entry.update({
+                        "wake_at": wake_at,
+                        "snoozed_at": now,
+                        "snooze_message": reminder,
+                        # Persist this intermediate state before closing. It
+                        # prevents refresh from treating the original live
+                        # pane as an early manual revival during the small gap.
+                        "snooze_state": "closing",
+                    })
+                    if not self._append_history(entry):
+                        return {"ok": False, "error":
+                                "could not durably store snooze history"}
+                    snooze_key = self._snooze_key(original_key)
+                    previous = self.snoozes.get(snooze_key)
+                    self.snoozes[snooze_key] = entry
+                    if not self._save_snoozes():
+                        if previous is None:
+                            self.snoozes.pop(snooze_key, None)
+                        else:
+                            self.snoozes[snooze_key] = previous
+                        return {"ok": False, "error":
+                                "could not durably schedule snooze"}
+                    st["_last_archived"] = [st.get("sess_ref"), st.get("title")]
+                    history = list(st.get("history") or [])
+                    history.append({"agent": entry["agent"], "title": entry["title"],
+                                    "closed": now})
+                    st["history"] = history[-10:]
                 self._save()
             elif op == "unread":
                 tid = self.pane_to_tid.get(cmd.get("pane_id"))
@@ -1334,6 +1711,7 @@ class InboxDaemon:
                     return {"ok": False, "error":
                             "no agent in pane %s" % cmd.get("pane_id")}
                 st["unread"] = True
+                st["unread_origin"] = "manual"
                 st["flagged_at"] = now
                 title = st.get("title") or st.get("agent") or ""
             elif op == "set-title":
@@ -1363,28 +1741,48 @@ class InboxDaemon:
                 return {"ok": True, "pong": True}
             else:
                 return {"ok": False, "error": "unknown cmd %r" % op}
-        if op == "archive":
+        if op in ("archive", "snooze"):
             try:
                 current = herdr_request("agent.list", {}).get("agents", [])
                 live = next((r for r in current if r.get("pane_id") == pane_id), None)
                 if not live or self._session_key(live) != original_key \
                         or live.get("agent_status") not in ("idle", "done"):
+                    if op == "snooze" and snooze_key:
+                        with self.lock:
+                            pending = self.snoozes.pop(snooze_key, None)
+                            if pending is not None and not self._save_snoozes():
+                                self.snoozes[snooze_key] = pending
                     return {"ok": False, "error":
-                            "agent changed while archiving; pane left open"}
+                            "agent changed while %s; pane left open" % op}
                 herdr_request("pane.close", {"pane_id": pane_id})
+                if op == "snooze" and snooze_key:
+                    with self.lock:
+                        pending = self.snoozes.get(snooze_key)
+                        if pending is not None:
+                            pending["snooze_state"] = "pending"
+                            self._save_snoozes()
             except (OSError, RuntimeError) as e:
+                # Keep a snooze pending when close outcome is uncertain. If
+                # the pane stayed live, the next refresh consumes it without
+                # waking anything; if the close landed, the alarm survives.
                 return {"ok": False, "error":
-                        "archive saved, but pane stayed open: %s" % e}
+                        "%s saved, but could not confirm pane close: %s" % (op, e)}
         self.dirty.set()
-        return {"ok": True, "title": title}
+        response = {"ok": True, "title": title}
+        if op == "snooze":
+            response.update({"wake_at": wake_at, "message": reminder})
+        return response
 
     def _on_focus(self, pane_id):
         with self.lock:
             tid = self.pane_to_tid.get(pane_id)
             st = self.terminals.get(tid)
-            if st and st.get("unread") \
-                    and time.time() - st.get("flagged_at", 0) > 1.5:
+            if st and st.get("unread") and (
+                    st.get("unread_origin") == "snooze"
+                    or time.time() - st.get("flagged_at", 0) > 1.5):
                 st["unread"] = False
+                st["unread_origin"] = None
+                st["reminder"] = ""
                 self.dirty.set()
 
     # -- threads --
@@ -1499,7 +1897,7 @@ class InboxDaemon:
         threading.Thread(target=self.events_loop, daemon=True).start()
         threading.Thread(target=self.summarize_loop, daemon=True).start()
         while not self.stop.is_set():
-            fired = self.dirty.wait(TICK_SECS)
+            fired = self.dirty.wait(self._next_wake_delay())
             if fired:
                 self.dirty.clear()
                 time.sleep(DEBOUNCE_SECS)  # coalesce event bursts
@@ -1512,7 +1910,8 @@ def main():
     # nothing it creates should be group/world-readable.
     os.umask(0o077)
     d = InboxDaemon()
-    for name in ("state.json", "history.jsonl", "daemon.log", "daemon.log.1",
+    for name in ("state.json", "history.jsonl", "snoozes.json",
+                 "daemon.log", "daemon.log.1",
                  "daemon.lock", "tui_prefs.json"):
         try:
             os.chmod(os.path.join(d.dir, name), 0o600)
