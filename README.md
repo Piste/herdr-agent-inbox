@@ -40,8 +40,8 @@ resumable. Also includes session titles, running times, and workspace rollups fo
 - **Sidebar resize** — grow/shrink herdr's sidebar from the keyboard (and
   keep herdr's native mouse-drag working).
 
-Everything runs through herdr's public plugin surface — no fork, no patches,
-stdlib Python only.
+Everything runs through herdr's public plugin surface — no changes to herdr
+itself, and only stdlib Python.
 
 ## The popup
 
