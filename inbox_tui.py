@@ -630,7 +630,7 @@ def run(stdscr):
     except curses.error:
         pass
     curses.mousemask(curses.ALL_MOUSE_EVENTS)
-    stdscr.timeout(2000)  # refresh every 2s when idle
+    stdscr.timeout(500)  # cheap live calls; keep external state feeling immediate
 
     prefs = load_prefs()
     mode = prefs.get("view")
