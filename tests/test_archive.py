@@ -150,6 +150,34 @@ class ArchiveViewTests(unittest.TestCase):
             "session_start_source": "resume",
         })
 
+    def test_restore_focuses_new_pane_after_launch(self):
+        entry = {
+            "agent": "codex", "sess_kind": "id", "sess_value": "thread-7",
+            "pane_id": "w9:p2", "cwd": "/work/project",
+        }
+
+        def cli(*args):
+            if args == ("pane", "get", "w9:p2"):
+                return {"pane": {"pane_id": "w9:p2"}}
+            if args[:2] == ("pane", "split"):
+                return {"pane": {"pane_id": "w9:p4"}}
+            if args[:3] == ("pane", "run", "w9:p4"):
+                return {}
+            raise AssertionError(args)
+
+        with mock.patch.object(inbox_tui, "_herdr_cli", side_effect=cli), \
+                mock.patch.object(inbox_tui, "report_resumed_session") as report, \
+                mock.patch.object(inbox_tui, "herdr_request") as request:
+            request.side_effect = lambda method, params: (
+                {"agents": []} if method == "agent.list" else {})
+            self.assertIsNone(inbox_tui.do_resume(entry))
+
+        report.assert_called_once_with(entry, "w9:p4")
+        request.assert_has_calls([
+            mock.call("agent.list", {}),
+            mock.call("pane.focus", {"pane_id": "w9:p4"}),
+        ])
+
     def test_silent_herdr_success_is_not_a_restore_failure(self):
         completed = subprocess.CompletedProcess(
             args=["herdr"], returncode=0, stdout="", stderr="")

@@ -391,6 +391,13 @@ def do_resume(entry):
         _herdr_cli("pane", "close", new_pane)
         return "could not revive chat: %s" % result["_error"]
     report_resumed_session(entry, new_pane)
+    try:
+        # The split/create focus happens while this popup still owns the UI.
+        # Reassert the destination after launch so closing the popup reveals
+        # the revived conversation rather than its original invoking pane.
+        herdr_request("pane.focus", {"pane_id": new_pane})
+    except (OSError, RuntimeError, ValueError) as e:
+        return "chat revived, but could not focus it: %s" % e
     return None
 
 

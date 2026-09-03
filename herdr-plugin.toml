@@ -6,7 +6,7 @@
 
 id = "herdr-agent-inbox"
 name = "herdr-agent-inbox"
-version = "0.2.4"
+version = "0.2.5"
 description = "Inbox for live agents with safe archive, search, and revive."
 min_herdr_version = "0.7.0"
 platforms = ["linux", "macos"]
