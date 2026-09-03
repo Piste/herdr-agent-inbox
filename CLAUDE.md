@@ -6,19 +6,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A [herdr](https://herdr.dev) plugin (stdlib Python only, no dependencies) that
 turns herdr's agent sidebar into an inbox: transcript-derived session titles,
-settle/mark-unread triage ordering, per-agent runtimes, workspace rollups, and
-an accumulated, resumable chat history. Everything drives herdr through its
+safe archive/revive, per-agent runtimes, workspace rollups, and a searchable,
+resumable archive. Everything drives herdr through its
 public socket API and plugin manifest — never patch or assume herdr internals;
 verify against the installed CLI (`herdr --help`, `herdr api schema --json`).
 
 ## Commands
 
 ```sh
-python3 -m py_compile daemon.py actions.py inbox_tui.py   # syntax gate (no test suite yet)
+python3 -m py_compile daemon.py actions.py inbox_tui.py   # syntax gate
+python3 -m unittest discover -s tests -v                  # behavior tests
 python3 inbox_tui.py --demo          # run the popup standalone with canned data (no herdr needed)
 sh scripts/restart-daemon.sh         # kill + restart the daemon (verifies pid, waits for flock)
 herdr plugin link "$PWD"             # (re)register with a live herdr — rereads herdr-plugin.toml
-herdr plugin action invoke settle --plugin herdr-agent-inbox   # exercise an action end-to-end
+herdr plugin action invoke archive --plugin herdr-agent-inbox  # archives only idle/done sessions
 tail -f "$(dirname "${HERDR_SOCKET_PATH:-$HOME/.config/herdr/herdr.sock}")/agent-inbox-state/daemon.log"
 ```
 
@@ -66,20 +67,17 @@ Shared conventions all three must agree on:
   Deliberately NOT `$HERDR_PLUGIN_STATE_DIR` — the daemon may be started from
   a shell without plugin env, and all entry points must resolve identical
   paths.
-- **Control protocol** ops (`settle`, `unread`, `clear`, `retitle`,
-  `set-title`, `settle-workspace`, `ping`) live in `handle_command`; the
+- **Control protocol** ops (`archive`, `retitle`, `set-title`, `ping`)
+  live in `handle_command`; the
   control thread must never die (it answers malformed input, never raises).
 - **`herdr_request` raises only `RuntimeError`/`OSError`** — callers catch
   exactly those. Don't let `ValueError` leak from JSON parsing; a herdr
   restart mid-request must never kill a thread.
-- **Rank tiers** (`rank_for`): blocked=0, done/unread=1, working=2, idle=3,
-  unknown=4, settled=5. Settling clears on transition INTO working/blocked;
-  settled outranks done so an explicitly settled agent stays sunk after
-  finishing.
-- **Archiving**: `_archive_chat` appends to both the per-terminal history (⚫
-  rows in the tree, capped 10) and `history.jsonl` (global browser + resume,
-  compacted atomically). Archive triggers: session-ref change, agent-kind
-  change, pane gone >120s. Resume commands are built only from
+- **Rank tiers** (`rank_for`): blocked=0, done=1, working=2, idle=3,
+  unknown=4.
+- **Archiving**: verify a native session ref and idle/done status, fsync
+  `history.jsonl`, recheck the same session/status, then close the exact pane.
+  Never weaken this ordering. Resume commands are built only from
   `sess_kind`/`sess_value` via `resume_cmd()` with `shlex.quote`.
 
 ## Constraints

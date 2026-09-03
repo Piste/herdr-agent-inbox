@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """herdr-agent-inbox popup TUI.
 
-An inbox over all agent panes: attention first, settled at the bottom.
+An inbox over live agent panes, with a searchable archive.
 
 Keys:
   j/k, arrows   move          enter  focus agent (closes popup)
-  s             settle        u      mark unread
-  c             clear settle/unread flag
-  S             settle every finished (done/idle) agent
+  a             archive idle/done agent (durably, then close its pane)
+  u / h         browse archived agents
+  /             search archive
   r             regenerate title
   g             toggle group-by-workspace
   q / esc       quit
 
 Mouse:
   left click    select        double left click   focus agent
-  right click   toggle settle/unsettle on the row under the cursor
+  right click   archive the idle/done row under the cursor
 """
 
 import curses
@@ -182,6 +182,8 @@ def load_agents():
             "age": tokens.get("age") or "",
             "since": tokens.get("since") or "",
             "flag": tokens.get("flag") or "",
+            "sess_kind": (rec.get("agent_session") or {}).get("kind"),
+            "sess_value": (rec.get("agent_session") or {}).get("value"),
         })
     rows.sort(key=lambda r: (r["rank"], -r["seq"]))
     return rows
@@ -219,7 +221,26 @@ def load_history():
         return {}
 
 
-def load_hist_entries():
+def session_key(item):
+    value = item.get("sess_value")
+    return (item.get("agent"), item.get("sess_kind"), value) if value else None
+
+
+def filter_history(entries, query):
+    words = query.casefold().split()
+    if not words:
+        return entries
+    out = []
+    for entry in entries:
+        haystack = " ".join(str(entry.get(k) or "") for k in (
+            "title", "agent", "workspace", "workspace_id", "cwd", "sess_value"
+        )).casefold()
+        if all(word in haystack for word in words):
+            out.append(entry)
+    return out
+
+
+def load_hist_entries(live_rows=None):
     """Archived chats from the daemon's history.jsonl, newest first."""
     if DEMO:
         return _demo_history()
@@ -228,7 +249,7 @@ def load_hist_entries():
     entries = []
     try:
         with open(p) as f:
-            for ln in f.readlines()[-200:]:
+            for ln in f:
                 try:
                     entries.append(json.loads(ln))
                 except ValueError:
@@ -238,10 +259,12 @@ def load_hist_entries():
     entries.reverse()  # newest first
     # A chat resumed and closed again re-archives under the same session
     # ref — keep only the newest entry per session.
+    live = {session_key(r) for r in (live_rows or []) if session_key(r)}
     seen, uniq = set(), []
     for e in entries:
-        key = (e.get("agent"), e.get("sess_value")) if e.get("sess_value") \
-            else id(e)
+        key = session_key(e) or ("legacy", e.get("closed"), e.get("title"))
+        if key in live:
+            continue
         if key in seen:
             continue
         seen.add(key)
@@ -267,10 +290,12 @@ def resume_cmd(entry):
 def _herdr_cli(*args):
     herdr = os.environ.get("HERDR_BIN_PATH", "herdr")
     r = subprocess.run([herdr, *args], capture_output=True, text=True)
+    if r.returncode:
+        return {"_error": (r.stderr or r.stdout or "herdr command failed").strip()}
     try:
         return json.loads(r.stdout).get("result") or {}
     except ValueError:
-        return {}
+        return {"_error": "invalid response from herdr"}
 
 
 def do_resume(entry):
@@ -282,6 +307,15 @@ def do_resume(entry):
     cmd = resume_cmd(entry)
     if not cmd:
         return "no resumable session ref for this chat"
+    try:
+        for rec in herdr_request("agent.list", {}).get("agents", []):
+            sess = rec.get("agent_session") or {}
+            live_key = (rec.get("agent"), sess.get("kind"), sess.get("value"))
+            if live_key == session_key(entry):
+                herdr_request("agent.focus", {"target": rec.get("pane_id")})
+                return None
+    except (OSError, RuntimeError, ValueError):
+        pass
     new_pane = None
     target = None
     pane = entry.get("pane_id")
@@ -310,7 +344,10 @@ def do_resume(entry):
                 new_pane = panes[0].get("pane_id")
     if not new_pane:
         return "could not open a pane to resume into"
-    _herdr_cli("pane", "run", new_pane, cmd)
+    result = _herdr_cli("pane", "run", new_pane, cmd)
+    if result.get("_error"):
+        _herdr_cli("pane", "close", new_pane)
+        return "could not revive chat: %s" % result["_error"]
     return None
 
 
@@ -382,11 +419,19 @@ def _sel_key_of(line):
     return ("arch", item.get("sess_value") or item.get("closed"))
 
 
+def _agent_labels_needed(lines):
+    """Only spend screen space on agent kinds when they distinguish rows."""
+    agents = {
+        item.get("agent")
+        for kind, item in lines
+        if kind in ("row", "hist", "closed") and item.get("agent")
+    }
+    return len(agents) > 1
+
+
 def chat_emoji(r):
     # Herdr's sidebar language: red=blocked, yellow=working,
     # teal/blue=finished-unseen, green=idle/clear.
-    if r["rank"] == "5":
-        return "🏁"
     if r["status"] == "blocked":
         return "🔴"
     if r["rank"] == "1":
@@ -398,7 +443,7 @@ def chat_emoji(r):
     return "⚪"
 
 
-_EMOJI_ORDER = ["🔴", "🔵", "🟡", "🟢", "🏁", "⚫", "⚪"]
+_EMOJI_ORDER = ["🔴", "🔵", "🟡", "🟢", "⚫", "⚪"]
 
 
 def _agg(emojis):
@@ -494,8 +539,6 @@ def _group_flag(group):
         return "●"
     if any(r["status"] == "working" for r in group):
         return "▸"
-    if all(r["rank"] == "5" for r in group):
-        return "⚑"
     return "○"
 
 
@@ -545,17 +588,15 @@ def save_prefs(prefs):
 
 
 def counts_line(rows):
-    c = {"attention": 0, "working": 0, "idle": 0, "settled": 0}
+    c = {"attention": 0, "working": 0, "idle": 0}
     for r in rows:
         if r["rank"] in ("0", "1"):
             c["attention"] += 1
         elif r["rank"] == "2":
             c["working"] += 1
-        elif r["rank"] == "5":
-            c["settled"] += 1
         else:
             c["idle"] += 1
-    return "%(attention)d need attention · %(working)d working · %(idle)d idle · %(settled)d settled" % c
+    return "%(attention)d need attention · %(working)d working · %(idle)d idle" % c
 
 
 def run(stdscr):
@@ -596,6 +637,8 @@ def run(stdscr):
     if mode not in VIEW_MODES:
         mode = "tree"
     hist_mode = False
+    hist_query = ""
+    search_edit = False
     sel = 0
     sel_key = None
     status_msg = ""
@@ -607,12 +650,14 @@ def run(stdscr):
             err = None
         except (OSError, RuntimeError, ValueError) as e:
             err = str(e)
+        archive = load_hist_entries(rows)
         if hist_mode:
-            lines = [("hist", e) for e in load_hist_entries()]
+            lines = [("hist", e) for e in filter_history(archive, hist_query)]
         elif mode == "tree":
-            lines = build_tree(rows, load_hist_entries())
+            lines = build_tree(rows, [])
         else:
             lines = build_lines(rows, mode)
+        show_agent = _agent_labels_needed(lines)
         row_idx = [i for i, (kind, _) in enumerate(lines)
                    if kind in ("row", "hist", "closed")]
         if row_idx:
@@ -628,12 +673,15 @@ def run(stdscr):
         h, w = stdscr.getmaxyx()
         stdscr.erase()
         if hist_mode:
-            header = " Chat history — %d archived (newest first)" % len(lines)
-            help_line = " enter/dbl-click:reopen chat (↩ = resumable)  h:back  q:quit"
+            header = " Archive — %d of %d" % (len(lines), len(archive))
+            if hist_query:
+                header += " matching %r" % hist_query
+            help_line = (" search: %s" % hist_query) if search_edit else \
+                " /:search  enter/dbl-click:revive  u/h:back  q:quit"
         else:
             header = " Agent Inbox — %s" % counts_line(rows)
-            help_line = (" enter:focus  s:settle  u:unread  c:clear  S:settle-finished"
-                         "  r:retitle  g:view  h:history  q:quit  |  right-click: settle")
+            help_line = (" enter:focus  a:archive idle/done  r:retitle"
+                         "  g:view  u/h:archive  q:quit  |  right-click:archive")
         if err:
             header += "  (herdr unreachable — showing stale data)"
         try:
@@ -693,9 +741,11 @@ def run(stdscr):
                     stdscr.addnstr(yy, 0, " " * (w - 1), w - 1, sel_pair)
                 when = time.strftime("%d/%m %H:%M", time.localtime(item.get("closed", 0)))
                 x = seg(yy, 1, when, pick(curses.A_DIM, on))
-                x = seg(yy, x, "  %s" % item.get("agent", "?"),
-                        pick(curses.color_pair(4), on))
-                x = seg(yy, x, ": ", pick(curses.A_DIM, on))
+                x = seg(yy, x, "  ", pick(curses.A_DIM, on))
+                if show_agent:
+                    x = seg(yy, x, item.get("agent", "?"),
+                            pick(curses.color_pair(4), on))
+                    x = seg(yy, x, ": ", pick(curses.A_DIM, on))
                 x = seg(yy, x, item.get("title", ""), pick(0, on))
                 meta = "  %s%s" % (item.get("workspace") or item.get("workspace_id") or "",
                                    "  ↩" if resume_cmd(item) else "")
@@ -705,8 +755,9 @@ def run(stdscr):
                 on = bool(row_idx and i == row_idx[sel])
                 if on:
                     stdscr.addnstr(yy, 0, " " * (w - 1), w - 1, sel_pair)
-                x = seg(yy, item.get("x", 7), "%s: %s" % (item.get("agent", "?"),
-                                                          item.get("title", "")),
+                label = ("%s: %s" % (item.get("agent", "?"), item.get("title", ""))
+                         if show_agent else item.get("title", ""))
+                x = seg(yy, item.get("x", 7), label,
                         pick(curses.A_DIM, on))
                 seg(yy, x, " — ⚫%s" % ("  ↩" if resume_cmd(item) else ""),
                     pick(curses.A_DIM, on))
@@ -722,8 +773,7 @@ def run(stdscr):
                     seg(yy, x, "  (%d)" % item["count"], curses.A_DIM)
                 continue
             r = item
-            icon = "⚑" if r["rank"] == "5" else (
-                "●" if r["flag"] == "●" else STATUS_ICON.get(r["status"], "?"))
+            icon = STATUS_ICON.get(r["status"], "?")
             attr = curses.A_NORMAL
             if r["status"] == "blocked":
                 attr = curses.color_pair(1) | curses.A_BOLD
@@ -731,15 +781,15 @@ def run(stdscr):
                 attr = curses.color_pair(3) | curses.A_BOLD   # done/unread: teal
             elif r["status"] == "working":
                 attr = curses.color_pair(2)                   # working: yellow
-            elif r["rank"] == "5":
-                attr = curses.A_DIM
             selected = bool(row_idx and i == row_idx[sel])
             if mode == "tree":
                 if selected:
                     stdscr.addnstr(yy, 0, " " * (w - 1), w - 1, sel_pair)
-                x = seg(yy, r.get("_x", 7), r["agent"],
-                        pick(curses.color_pair(4), selected))
-                x = seg(yy, x, ": ", pick(curses.A_DIM, selected))
+                x = r.get("_x", 7)
+                if show_agent:
+                    x = seg(yy, x, r["agent"],
+                            pick(curses.color_pair(4), selected))
+                    x = seg(yy, x, ": ", pick(curses.A_DIM, selected))
                 x = seg(yy, x, r["title"][: max(10, w - x - 8)], pick(attr, selected))
                 x = seg(yy, x, " — ", pick(curses.A_DIM, selected))
                 seg(yy, x, chat_emoji(r), pick(0, selected))
@@ -748,13 +798,18 @@ def run(stdscr):
                 yy = top + y
                 if selected:
                     stdscr.addnstr(yy, 0, " " * (w - 1), w - 1, sel_pair)
-                title = r["title"][: max(10, w - len(r["agent"]) - 12)]
+                agent_space = len(r["agent"]) + 3 if show_agent else 0
+                title = r["title"][: max(10, w - agent_space - 12)]
                 x = seg(yy, 4, title, pick(attr, selected))
-                x = seg(yy, x, " — ", pick(curses.A_DIM, selected))
-                seg(yy, x, r["agent"], pick(curses.color_pair(4), selected))
+                if show_agent:
+                    x = seg(yy, x, " — ", pick(curses.A_DIM, selected))
+                    seg(yy, x, r["agent"], pick(curses.color_pair(4), selected))
                 continue
-            meta = ("%s · %s" % (r["agent"], r["age"]) if mode == "grouped"
-                    else "%s · %s · %s" % (r["agent"], r["workspace"], r["age"]))
+            if mode == "grouped":
+                meta = "%s · %s" % (r["agent"], r["age"]) if show_agent else r["age"]
+            else:
+                meta = ("%s · %s · %s" % (r["agent"], r["workspace"], r["age"])
+                        if show_agent else "%s · %s" % (r["workspace"], r["age"]))
             indent = "   " if mode == "grouped" else " "
             avail = max(10, w - len(meta) - len(indent) - 7)
             text = "%s%s %-*s  %s" % (indent, icon, avail, r["title"][:avail], meta)
@@ -762,26 +817,53 @@ def run(stdscr):
             stdscr.addnstr(top + y, 0, text.ljust(w - 1), w - 1, attr)
         stdscr.refresh()
         status_msg = ""
+        if search_edit:
+            try:
+                curses.curs_set(1)
+                stdscr.move(h - 1, min(w - 2, len(" search: ") + _wwidth(hist_query)))
+            except curses.error:
+                pass
+        else:
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
 
         def send_op(op, row):
             try:
                 resp = control_send({"cmd": op, "pane_id": row["pane_id"]})
                 if not resp.get("ok"):
                     return " %s failed: %s" % (op, resp.get("error"))
-                time.sleep(0.6)  # let the daemon re-report before refresh
                 return ""
             except (OSError, ValueError) as e:
                 return " daemon not reachable: %s" % e
 
         ch = stdscr.getch()
+        if search_edit:
+            if ch in (10, 13):
+                search_edit = False
+            elif ch == 27:
+                search_edit = False
+            elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                hist_query = hist_query[:-1]
+            elif 32 <= ch <= 0x10ffff:
+                hist_query += chr(ch)
+            sel = 0
+            sel_key = None
+            continue
         if ch in (ord("q"), 27):
             return
         if ch == -1:
             continue  # timeout -> refresh
-        if ch == ord("h"):
+        if ch in (ord("h"), ord("u")):
             hist_mode = not hist_mode
+            hist_query = ""
+            search_edit = False
             sel = 0
             sel_key = None
+            continue
+        if ch == ord("/") and hist_mode:
+            search_edit = True
             continue
         if ch == ord("g") and not hist_mode:
             mode = VIEW_MODES[(VIEW_MODES.index(mode) + 1) % len(VIEW_MODES)]
@@ -813,11 +895,7 @@ def run(stdscr):
                 continue
             if bstate & (curses.BUTTON3_CLICKED | curses.BUTTON3_PRESSED
                          | curses.BUTTON3_RELEASED):
-                # Right-click: toggle settled/unsettled on the row under cursor.
-                op = "clear" if (row["rank"] == "5" or row["flag"]) else "settle"
-                status_msg = send_op(op, row) or (
-                    " ⚑ settled: %s" % row["title"] if op == "settle"
-                    else " cleared: %s" % row["title"])
+                status_msg = send_op("archive", row) or (" archived: %s" % row["title"])
             elif bstate & curses.BUTTON1_DOUBLE_CLICKED:
                 try:
                     herdr_request("agent.focus", {"target": row["pane_id"]})
@@ -848,23 +926,12 @@ def run(stdscr):
                 status_msg = " focus failed: %s" % e
                 continue
             return
-        elif ch in (ord("s"), ord("u"), ord("r"), ord("c")):
+        elif ch in (ord("a"), ord("r")):
             if cur_kind in ("hist", "closed"):
-                status_msg = " archived chat — enter reopens it"
+                status_msg = " archived chat — enter revives it"
                 continue
-            op = {"s": "settle", "u": "unread", "r": "retitle", "c": "clear"}[chr(ch)]
+            op = {"a": "archive", "r": "retitle"}[chr(ch)]
             status_msg = send_op(op, cur)
-        elif ch == ord("S") and not hist_mode:
-            n = 0
-            for r in rows:
-                if r["status"] in ("done", "idle") and r["rank"] != "5":
-                    try:
-                        if control_send({"cmd": "settle", "pane_id": r["pane_id"]}).get("ok"):
-                            n += 1
-                    except (OSError, ValueError):
-                        break
-            status_msg = " settled %d agents" % n
-            time.sleep(0.6)
 
 
 def main():

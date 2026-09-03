@@ -1,13 +1,9 @@
 # herdr-agent-inbox
 
-**An inbox for your coding agents.** Session titles, settle / mark-unread
-triage, running times, workspace rollups, and a ChatGPT-style resumable chat
-history — for every agent running in [herdr](https://herdr.dev).
-
-Inspired by [T3 Code's "settle" workflow](https://x.com/theo/status/2079892861689254129):
-
-> *"Think of it more like an inbox. When you're done with a thread, click the
-> 'settle' button and it slides to the bottom. This has helped me 'finish' more."*
+**An actual inbox for your coding agents.** Live agents stay in the Agents
+pane; archived agents disappear from it but remain searchable and resumable.
+Also includes session titles, running times, and workspace rollups for
+[herdr](https://herdr.dev).
 
 ![Tree view — workspaces, directories, chats with live state and archived history](assets/tree.png)
 
@@ -17,18 +13,16 @@ Inspired by [T3 Code's "settle" workflow](https://x.com/theo/status/207989286168
   conversation ("Fix flaky payment webhook tests"), not just `claude` or a
   directory name. Reads the agent's native transcript (claude / pi / codex),
   optionally summarized by any LLM command you configure.
-- **Inbox triage** — the Agents sidebar becomes an attention queue: blocked →
-  finished-unseen → working → idle → **settled at the bottom**. Settle an
-  agent when you're done with it; it auto-reopens the moment it works again.
-  Mark one unread to pin it back on top.
-- **Chat history that accumulates** — closed conversations stay listed under
-  their workspace/directory (and in a global history browser), and the ones
-  with session refs **reopen in place** with `claude --resume` / `pi
-  --session` / `codex resume`.
+- **Safe archive** — `a` durably records a verifiably resumable idle/done
+  session, rechecks that it did not become active, then closes its exact pane.
+  Working, blocked, unknown, or transcript-less agents are refused.
+- **Search and revive** — `u` opens the archive, `/` searches title,
+  workspace, path, agent, and session ID, and Enter revives the session.
+  A session already live is focused instead of duplicated.
 - **Running times** — how long each session has lived and how long it's been
   in its current state, live in the sidebar.
 - **Workspace rollups** — each workspace row shows its agents by state
-  (`!1 ●2 ▸1 ⚑3`) plus the longest-running busy stint.
+  (`!1 ●2 ▸1 ○3`) plus the longest-running busy stint.
 - **Sidebar resize** — grow/shrink herdr's sidebar from the keyboard (and
   keep herdr's native mouse-drag working).
 
@@ -37,32 +31,30 @@ stdlib Python only.
 
 ## The popup
 
-`prefix+i` opens the inbox. `g` rotates four views, `h` opens history.
+`prefix+i` opens the inbox. `g` rotates four views, `u` opens the archive.
 
 **Compact** — one line per chat, workspace headers with a dominant-state flag:
 
 ![Compact view](assets/compact.png)
 
-**History** — every closed chat, newest first; `↩` means resumable:
+**Archive** — every archived chat, newest first; `↩` means resumable:
 
 ![History browser](assets/history.png)
 
 | Key | Action |
 |---|---|
 | `enter` / double-click | Focus the agent (or reopen an archived chat) |
-| `s` / right-click | Settle (right-click toggles) |
-| `u` | Mark unread |
-| `c` | Clear settle/unread flag |
-| `S` | Settle every finished agent |
+| `a` / right-click | Archive an idle/done agent |
+| `u` / `h` | Archive browser / back |
+| `/` | Search the archive |
 | `r` | Regenerate the title |
 | `g` | Rotate view: tree → compact → grouped → flat |
-| `h` | Chat history browser |
 | `q` / esc | Close |
 
 ### State legend
 
 `🔴` / `!` blocked · `🔵` / `●` finished, unseen · `🟡` / `▸` working ·
-`🟢` / `○` idle · `🏁` / `⚑` settled · `⚫` closed chat — matching herdr's
+`🟢` / `○` idle · `⚫` archived chat — matching herdr's
 own sidebar color language (red/teal/yellow/green), in your herdr theme's
 exact palette.
 
@@ -71,7 +63,7 @@ exact palette.
 Requires herdr ≥ 0.7.0 and `python3` (3.11+ recommended) on PATH.
 
 ```sh
-herdr plugin install douglascorrea/herdr-agent-inbox
+herdr plugin install Piste/herdr-agent-inbox
 ```
 
 The daemon starts with your session (and a watchdog revives it). Then wire up
@@ -96,7 +88,7 @@ rows = [
 ```
 
 Available pane tokens: `$title`, `$age` (session running time), `$since`
-(time in current state), `$flag` (⚑ settled / ● unread). Workspace tokens:
+(time in current state), `$flag` (● finished-unseen). Workspace tokens:
 `$agents` (state counts), `$busy` (longest working stint). Styled custom
 tokens keep the `$` prefix; builtins stay bare.
 
@@ -106,20 +98,8 @@ tokens keep the `$` prefix; builtins stay bare.
 [[keys.command]]
 key = "prefix+m"
 type = "shell"
-description = "settle agent (slides to bottom of inbox)"
-command = "herdr plugin action invoke settle --plugin herdr-agent-inbox"
-
-[[keys.command]]
-key = "prefix+shift+m"
-type = "shell"
-description = "mark agent unread (back to attention tier)"
-command = "herdr plugin action invoke unread --plugin herdr-agent-inbox"
-
-[[keys.command]]
-key = "prefix+alt+m"
-type = "shell"
-description = "settle all finished agents in workspace"
-command = "herdr plugin action invoke settle-workspace --plugin herdr-agent-inbox"
+description = "archive focused idle/done agent"
+command = "herdr plugin action invoke archive --plugin herdr-agent-inbox"
 
 [[keys.command]]
 key = "prefix+i"
@@ -169,7 +149,7 @@ A tab is managed only while its label is herdr's default (the tab number) or
 the exact label the plugin last set — rename a tab yourself and the plugin
 leaves it alone forever after; reset it to the number to hand control back.
 When a tab holds several agents, the most attention-worthy one names it
-(blocked → unseen → working → idle → settled, most recent first).
+(blocked → unseen → working → idle, most recent first).
 
 `source = "last"` re-derives the title whenever the agent finishes a turn.
 Summaries run on an async worker, cached per prompt content (one call per
@@ -197,13 +177,12 @@ them back to `[20, 60]`, so keyboard and mouse resize coexist. Absolute width:
 - **`daemon.py`** — a stdlib-Python daemon started by the plugin's
   `[[startup]]` hook. Subscribes to herdr socket events, diffs `agent.list`,
   derives titles from native transcripts, and reports pane/workspace metadata
-  plus an `agent.view.set` inbox sort. Closed chats append to
-  `history.jsonl`. Settle/unread state lives in `state.json`, keyed by
-  terminal id, surviving restarts. A control socket serves the actions/TUI.
-- **`actions.py`** — the keybindable actions (settle, unread,
-  settle-workspace, retitle, set-title, sidebar resize, restart-daemon).
+  plus an `agent.view.set` inbox sort. Archives append and fsync to
+  `history.jsonl` before the pane is closed. A control socket serves the actions/TUI.
+- **`actions.py`** — the keybindable actions (archive, retitle, set-title,
+  sidebar resize, restart-daemon).
 - **`inbox_tui.py`** — the popup (`[[panes]]`, placement popup) with the four
-  views, mouse support, theme-matched colors, and the history browser.
+  views, mouse support, theme-matched colors, and searchable archive browser.
   Try it standalone with `python3 inbox_tui.py --demo`.
 
 State lives next to your herdr session socket in `agent-inbox-state/`

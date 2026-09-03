@@ -1,14 +1,13 @@
 # herdr-plugin.toml — manifest for herdr-agent-inbox.
 #
-# Inbox-style agent sidebar (inspired by T3 Code's "settle" workflow):
-# session titles, settle / mark-unread ordering, per-agent running time,
-# and per-workspace agent rollups. A small stdlib-Python daemon watches the
+# Inbox-style agent sidebar: live session titles, durable archive/revive,
+# per-agent running time, and per-workspace agent rollups. A stdlib-Python daemon watches the
 # herdr socket API and reports pane/workspace metadata + an agent view sort.
 
 id = "herdr-agent-inbox"
 name = "herdr-agent-inbox"
-version = "0.1.0"
-description = "Inbox for agents: session titles, settle/mark-unread ordering, runtimes, workspace rollups."
+version = "0.2.0"
+description = "Inbox for live agents with safe archive, search, and revive."
 min_herdr_version = "0.7.0"
 platforms = ["linux", "macos"]
 
@@ -22,22 +21,10 @@ on = "pane.agent_detected"
 command = ["/bin/sh", "scripts/ensure-daemon.sh"]
 
 [[actions]]
-id = "settle"
-title = "Settle agent"
-description = "Mark the focused agent as settled — it slides to the bottom of the Agents panel."
-command = ["python3", "actions.py", "settle"]
-
-[[actions]]
-id = "unread"
-title = "Mark agent unread"
-description = "Flag the focused agent back into the attention tier (like marking an email unread)."
-command = ["python3", "actions.py", "unread"]
-
-[[actions]]
-id = "settle-workspace"
-title = "Settle workspace"
-description = "Settle every finished (done/idle) agent in the current workspace."
-command = ["python3", "actions.py", "settle-workspace"]
+id = "archive"
+title = "Archive agent"
+description = "Durably save and close the focused idle/done agent; revive it from Agent Inbox."
+command = ["python3", "actions.py", "archive"]
 
 [[actions]]
 id = "retitle"

@@ -5,15 +5,15 @@ Watches herdr's agent panes and decorates them with inbox metadata:
 
 - pane token/metadata `title`: session title derived from the agent's native
   session transcript (first real user prompt), like ChatGPT/Claude chat titles.
-- pane token `rank`: inbox tier (blocked=0, done/unread=1, working=2, idle=3,
-  unknown=4, settled=5) used by an `agent.view.set` sort so the Agents panel
-  behaves like an inbox: attention on top, settled slides to the bottom.
+- pane token `rank`: inbox tier (blocked=0, done=1, working=2, idle=3,
+  unknown=4) used by an `agent.view.set` sort.
 - pane tokens `age` (session running time) and `since` (time in current state).
-- pane token `flag`: "⚑" settled / "●" marked unread.
 - workspace tokens `agents` (per-status counts, e.g. "!1 ▸2 ✓1 ⚑1") and
   `busy` (longest currently-working stint).
 
-Settle / mark-unread commands arrive on a control socket (see actions.py).
+Archive commands arrive on a control socket (see actions.py). Archiving is a
+durable-record-before-close operation and is only allowed for verifiably
+resumable idle/done sessions.
 State persists across herdr server restarts keyed by terminal_id.
 
 Stdlib only. One herdr request per connection (the server closes the socket
@@ -45,25 +45,23 @@ TITLE_MAX = 56
 STATE_KEEP_SECS = 3 * 24 * 3600  # keep state for vanished terminals 3 days
 
 RANK_BLOCKED = "0"
-RANK_ATTENTION = "1"   # done (finished, unseen) or manually marked unread
+RANK_ATTENTION = "1"   # done (finished, unseen)
 RANK_WORKING = "2"
 RANK_IDLE = "3"
 RANK_UNKNOWN = "4"
-RANK_SETTLED = "5"
-
-FLAG_SETTLED = "⚑"   # ⚑
-FLAG_UNREAD = "●"    # ●
+FLAG_DONE = "●"
 
 # Agents whose native title we can only find by working directory (herdr
 # reports no session ref for them, or they never publish the title). Two live
 # panes of the same such agent in one directory are indistinguishable, so we
-# skip the lookup rather than risk labelling both with the same name. claude
-# and pi are keyed by their own transcript and are never ambiguous.
+# skip the lookup rather than risk labelling both with the same name. Codex is
+# only cwd-keyed before Herdr learns its exact thread id; claude and pi are
+# keyed by their own transcript and are never ambiguous.
 CWD_KEYED_AGENTS = ("codex", "grok", "cursor", "hermes")
 
 # Bump when title extraction changes so cached titles are re-derived instead
 # of surviving forever in state.json.
-TITLE_ALGO = 2
+TITLE_ALGO = 3
 
 VIEW_SORT = [
     {"field": {"token": "rank"}, "order": "asc"},
@@ -403,14 +401,12 @@ def _newest_json_title(candidates, keys, mtime_of=None):
     return best or (None, 0)
 
 
-def codex_native_title(cwd):
-    """codex keeps a per-thread `title` in ~/.codex/state_5.sqlite.
-
-    It is the verbatim first prompt rather than a short generated name, so it
-    gets truncated like any prompt-derived title — but it is authoritative,
-    already indexed by cwd, and works for panes with no session ref at all.
-    """
-    if not cwd:
+def codex_native_title(rec):
+    """Return Codex's own name for the exact Herdr-reported thread."""
+    sess = rec.get("agent_session") or {}
+    session_id = sess.get("value")
+    cwd = rec.get("cwd")
+    if not session_id and not cwd:
         return None
     db = os.path.expanduser("~/.codex/state_5.sqlite")
     if not os.path.exists(db):
@@ -421,18 +417,45 @@ def codex_native_title(cwd):
         con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=0.5)
         try:
             con.execute("PRAGMA query_only = 1")
-            row = con.execute(
-                "SELECT title, preview, first_user_message FROM threads "
-                "WHERE cwd = ? AND archived = 0 "
-                "ORDER BY COALESCE(updated_at_ms, 0) DESC LIMIT 1",
-                (cwd,),
-            ).fetchone()
+            columns = {r[1] for r in con.execute("PRAGMA table_info(threads)")}
+            title_columns = [
+                col for col in ("name", "title", "preview", "first_user_message")
+                if col in columns
+            ]
+            if not title_columns:
+                return None
+            selected = ", ".join('"%s"' % col for col in title_columns)
+            if session_id and "id" in columns:
+                row = con.execute(
+                    "SELECT %s FROM threads WHERE id = ? LIMIT 1" % selected,
+                    (session_id,),
+                ).fetchone()
+            elif cwd and "cwd" in columns:
+                active = " AND COALESCE(archived, 0) = 0" \
+                    if "archived" in columns else ""
+                updated = "updated_at_ms" if "updated_at_ms" in columns \
+                    else "updated_at"
+                row = con.execute(
+                    "SELECT %s FROM threads WHERE cwd = ?%s "
+                    "ORDER BY COALESCE(%s, 0) DESC LIMIT 1"
+                    % (selected, active, updated),
+                    (cwd,),
+                ).fetchone()
+            else:
+                row = None
         finally:
             con.close()
     except Exception:
         return None
-    for value in row or ():
-        title = _clean_title(str(value or ""))
+    values = dict(zip(title_columns, row or ()))
+    title = _clean_title(str(values.get("name") or ""))
+    if title:
+        return title
+    title = _clean_title(str(rec.get("terminal_title_stripped") or ""))
+    if title:
+        return title
+    for key in ("title", "preview", "first_user_message"):
+        title = _clean_title(str(values.get(key) or ""))
         if title:
             return title
     return None
@@ -599,7 +622,11 @@ def native_title_for(rec, path):
     if agent == "claude" and path:
         return native_title_from_transcript(path)
     if agent == "codex":
-        return codex_native_title(rec.get("cwd"))
+        return (
+            codex_native_title(rec)
+            or _clean_title(str(rec.get("terminal_title_stripped") or ""))
+            or None
+        )
     if agent == "pi" and path:
         return pi_native_title(path)
     if agent == "hermes":
@@ -735,20 +762,13 @@ class InboxDaemon:
     # -- inbox model --
 
     @staticmethod
-    def rank_for(status, settled, unread):
-        # `settled` outranks `done`: settling is an explicit "I'm finished with
-        # this thread". Fresh activity clears it (working/blocked transition),
-        # so anything genuinely new still surfaces.
+    def rank_for(status):
         if status == "blocked":
             return RANK_BLOCKED
-        if unread:
+        if status == "done":
             return RANK_ATTENTION
         if status == "working":
             return RANK_WORKING
-        if settled:
-            return RANK_SETTLED
-        if status == "done":
-            return RANK_ATTENTION
         if status == "idle":
             return RANK_IDLE
         return RANK_UNKNOWN
@@ -788,7 +808,7 @@ class InboxDaemon:
                     st["sum_hash"] = None
             self.sum_failed.clear()
 
-    def _archive_chat(self, st, now):
+    def _archive_chat(self, st, now, reason="closed"):
         """Archive st's current chat: into its in-pane history (capped 10,
         drives the tree's ⚫ rows) and the durable history.jsonl (drives the
         ChatGPT-style history browser, resumable via stored session refs)."""
@@ -799,7 +819,6 @@ class InboxDaemon:
         if fingerprint == tuple(st.get("_last_archived") or ()):
             return hist
         if st.get("title"):
-            st["_last_archived"] = list(fingerprint)
             entry = {
                 "agent": st.get("agent"),
                 "title": st["title"],
@@ -811,10 +830,12 @@ class InboxDaemon:
                 "cwd": st.get("cwd"),
                 "sess_kind": st.get("sess_kind"),
                 "sess_value": st.get("sess_value"),
+                "reason": reason,
             }
-            hist.append({"agent": entry["agent"], "title": entry["title"],
-                         "closed": now})
-            self._append_history(entry)
+            if self._append_history(entry):
+                st["_last_archived"] = list(fingerprint)
+                hist.append({"agent": entry["agent"], "title": entry["title"],
+                             "closed": now})
         return hist[-10:]
 
     def _append_history(self, entry):
@@ -829,8 +850,41 @@ class InboxDaemon:
                 os.replace(tmp, path)  # atomic — readers never see a partial file
             with open(path, "a") as f:
                 f.write(json.dumps(entry) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(path, 0o600)
+            return True
         except OSError as e:
             self.log("history append failed: %s" % e)
+            return False
+
+    @staticmethod
+    def _session_key(rec):
+        sess = rec.get("agent_session") or {}
+        value = sess.get("value")
+        return (rec.get("agent"), sess.get("kind"), value) if value else None
+
+    def _resume_error(self, rec):
+        """Return None only when this exact native session can be resumed."""
+        sess = rec.get("agent_session") or {}
+        kind, value = sess.get("kind"), sess.get("value")
+        if not value:
+            return "agent has no native session reference yet"
+        agent = rec.get("agent")
+        if agent == "codex" and kind == "id":
+            db = os.path.expanduser("~/.codex/state_5.sqlite")
+            row = _sqlite_scalar(
+                db, "SELECT rollout_path FROM threads WHERE id = ?", (value,))
+            path = row[0] if row else None
+            if path and os.path.isfile(path) and os.access(path, os.R_OK):
+                return None
+            return "Codex thread %s has no readable rollout" % value
+        if agent == "claude" and kind == "id":
+            return None if resolve_transcript(rec) else "Claude session transcript is missing"
+        if agent == "pi" and kind == "path":
+            return None if os.path.isfile(value) and os.access(value, os.R_OK) \
+                else "Pi session transcript is missing"
+        return "%s session references are not safely resumable yet" % (agent or "this agent")
 
     def _ensure_title(self, rec, st, now):
         """Generate/refresh the session title for one agent record."""
@@ -861,6 +915,9 @@ class InboxDaemon:
         # are looked up by their own transcript, so several of them in one
         # directory are fine.
         cwd_keyed = rec.get("agent") in CWD_KEYED_AGENTS
+        if rec.get("agent") == "codex" \
+                and (rec.get("agent_session") or {}).get("value"):
+            cwd_keyed = False
         if self.cfg["prefer_agent_title"] \
                 and not (cwd_keyed
                          and (rec.get("agent"), rec.get("cwd")) in self.ambiguous):
@@ -990,9 +1047,6 @@ class InboxDaemon:
                         "first_seen": now,
                         "last_status": rec.get("agent_status"),
                         "last_change": now,
-                        "settled": False,
-                        "unread": False,
-                        "flagged_at": 0,
                         "title": None,
                         "title_sess": None,
                         "title_tried": 0,
@@ -1004,11 +1058,7 @@ class InboxDaemon:
                 if status != st.get("last_status"):
                     st["last_change"] = now
                     st["last_status"] = status
-                    if status in ("working", "blocked"):
-                        # New activity reopens the item, Theo-style.
-                        st["settled"] = False
-                        st["unread"] = False
-                    elif self.cfg["title_source"] == "last":
+                    if status not in ("working", "blocked") and self.cfg["title_source"] == "last":
                         # Turn ended — the latest prompt may have changed.
                         st["title_stale"] = True
                         st["title_tried"] = 0
@@ -1027,8 +1077,8 @@ class InboxDaemon:
                     or st.get("agent")
                     or "agent"
                 )
-                rank = self.rank_for(status, st["settled"], st["unread"])
-                flag = FLAG_SETTLED if st["settled"] else (FLAG_UNREAD if st["unread"] else "")
+                rank = self.rank_for(status)
+                flag = FLAG_DONE if status == "done" else ""
                 tokens = {
                     "title": title,
                     "rank": rank,
@@ -1056,7 +1106,7 @@ class InboxDaemon:
             self._prune(seen_tids, now)
             self._save()
         # Socket round-trips happen OUTSIDE the lock so control commands
-        # (settle/unread/…) never queue behind a slow herdr server.
+        # Control commands never queue behind a slow herdr server.
         for item in pending:
             if item:
                 self._send_pane_report(*item)
@@ -1173,18 +1223,16 @@ class InboxDaemon:
         items = []
         now = time.time()
         for ws, entries in ws_agents.items():
-            counts = {"blocked": 0, "attention": 0, "working": 0, "idle": 0, "settled": 0}
+            counts = {"blocked": 0, "attention": 0, "working": 0, "idle": 0}
             busiest = 0
             for status, st, _ in entries:
                 if status == "blocked":
                     counts["blocked"] += 1
-                elif status == "done" or st.get("unread"):
+                elif status == "done":
                     counts["attention"] += 1
                 elif status == "working":
                     counts["working"] += 1
                     busiest = max(busiest, now - st.get("last_change", now))
-                elif st.get("settled"):
-                    counts["settled"] += 1
                 else:
                     counts["idle"] += 1
             pieces = []
@@ -1192,17 +1240,15 @@ class InboxDaemon:
             # separator, so a "·" glyph reads as a stray dash next to it.
             for key, sym in (
                 ("blocked", "!"),
-                ("attention", FLAG_UNREAD),
+                ("attention", FLAG_DONE),
                 ("working", "▸"),   # ▸
                 ("idle", "○"),      # ○
-                ("settled", FLAG_SETTLED),
             ):
                 if not counts[key]:
                     continue
                 # A lone idle agent is the workspace's default state — the
                 # space's own status icon already says it; skip the noise.
-                if key == "idle" and counts[key] == 1 and not pieces \
-                        and not counts["settled"]:
+                if key == "idle" and counts[key] == 1 and not pieces:
                     continue
                 pieces.append("%s%d" % (sym, counts[key]))
             tokens = {
@@ -1228,7 +1274,7 @@ class InboxDaemon:
             # this isn't just a server-restart or detection blip.
             if now - gone > 120 and not st.get("gone_archived"):
                 st["gone_archived"] = True
-                st["history"] = self._archive_chat(st, now)
+                st["history"] = self._archive_chat(st, now, "closed")
             if now - gone > STATE_KEEP_SECS:
                 del self.terminals[tid]
                 self.last_report.pop(tid, None)
@@ -1239,42 +1285,42 @@ class InboxDaemon:
         op = cmd.get("cmd")
         now = time.time()
         agents = None
-        if op == "settle-workspace":
-            # Network fetch happens BEFORE taking the lock.
+        if op == "archive":
             try:
                 agents = herdr_request("agent.list", {}).get("agents", [])
             except (OSError, RuntimeError) as e:
                 return {"ok": False, "error": str(e)}
+            pane_id = cmd.get("pane_id")
+            rec = next((r for r in agents if r.get("pane_id") == pane_id), None)
+            if not rec:
+                return {"ok": False, "error": "no agent in pane %s" % pane_id}
+            status = rec.get("agent_status") or "unknown"
+            if status not in ("idle", "done"):
+                return {"ok": False, "error":
+                        "archive requires an idle or done agent (currently %s)" % status}
+            err = self._resume_error(rec)
+            if err:
+                return {"ok": False, "error": err}
+            original_key = self._session_key(rec)
         with self.lock:
-            if op in ("settle", "unread", "clear"):
-                tid = self.pane_to_tid.get(cmd.get("pane_id"))
+            if op == "archive":
+                tid = self.pane_to_tid.get(pane_id)
                 if not tid or tid not in self.terminals:
-                    return {"ok": False, "error": "no agent in pane %s" % cmd.get("pane_id")}
+                    return {"ok": False, "error": "agent metadata is not ready; try again"}
                 st = self.terminals[tid]
-                if op == "settle":
-                    st["settled"] = True
-                    st["unread"] = False
-                elif op == "unread":
-                    st["unread"] = True
-                    st["settled"] = False
-                    st["flagged_at"] = now
-                else:
-                    st["settled"] = False
-                    st["unread"] = False
+                stored_key = (
+                    st.get("agent"), st.get("sess_kind"), st.get("sess_value"))
+                if stored_key != original_key:
+                    return {"ok": False, "error":
+                            "agent metadata changed; wait for inbox refresh and retry"}
                 title = st.get("title") or st.get("agent") or ""
-            elif op == "settle-workspace":
-                ws = cmd.get("workspace_id")
-                n = 0
-                for rec in agents:
-                    if rec.get("workspace_id") != ws:
-                        continue
-                    tid = rec.get("terminal_id")
-                    st = self.terminals.get(tid)
-                    if st and rec.get("agent_status") in ("done", "idle", "unknown"):
-                        st["settled"] = True
-                        st["unread"] = False
-                        n += 1
-                title = "%d agents" % n
+                fingerprint = (st.get("sess_ref"), st.get("title"))
+                already_saved = fingerprint == tuple(st.get("_last_archived") or ())
+                before = st.get("_last_archived")
+                st["history"] = self._archive_chat(st, now, "archived")
+                if not already_saved and st.get("_last_archived") == before:
+                    return {"ok": False, "error": "could not durably store archive record"}
+                self._save()
             elif op == "set-title":
                 tid = self.pane_to_tid.get(cmd.get("pane_id"))
                 st = self.terminals.get(tid)
@@ -1302,16 +1348,23 @@ class InboxDaemon:
                 return {"ok": True, "pong": True}
             else:
                 return {"ok": False, "error": "unknown cmd %r" % op}
+        if op == "archive":
+            try:
+                current = herdr_request("agent.list", {}).get("agents", [])
+                live = next((r for r in current if r.get("pane_id") == pane_id), None)
+                if not live or self._session_key(live) != original_key \
+                        or live.get("agent_status") not in ("idle", "done"):
+                    return {"ok": False, "error":
+                            "agent changed while archiving; pane left open"}
+                herdr_request("pane.close", {"pane_id": pane_id})
+            except (OSError, RuntimeError) as e:
+                return {"ok": False, "error":
+                        "archive saved, but pane stayed open: %s" % e}
         self.dirty.set()
         return {"ok": True, "title": title}
 
     def _on_focus(self, pane_id):
-        with self.lock:
-            tid = self.pane_to_tid.get(pane_id)
-            st = self.terminals.get(tid)
-            if st and st.get("unread") and time.time() - st.get("flagged_at", 0) > 1.5:
-                st["unread"] = False
-                self.dirty.set()
+        return
 
     # -- threads --
 
