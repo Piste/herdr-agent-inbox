@@ -1,5 +1,13 @@
 # herdr-agent-inbox
 
+> [!NOTE]
+> **Why this fork exists:** the original Agent Inbox's settle model keeps
+> settled threads live, so the Agents pane never truly clears. This fork turns
+> it into an actual inbox: safely archive or snooze idle/done threads, search them
+> later, and revive the exact session. Snoozed threads return unread without
+> stealing focus. Based, with thanks, on
+> [douglascorrea/herdr-agent-inbox](https://github.com/douglascorrea/herdr-agent-inbox).
+
 **An actual inbox for your coding agents.** Live agents stay in the Agents
 pane; archived and snoozed agents disappear but remain searchable and
 resumable. Also includes session titles, running times, and workspace rollups for
